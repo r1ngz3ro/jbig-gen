@@ -1,8 +1,8 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <string.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <cstring>
+#include <vector>
 
 uint32_t urand(void)
 {
@@ -19,6 +19,16 @@ uint32_t urand(void)
     fclose(f);
     return v;
 }
+
+static void append(std::vector<uint8_t> &v, const void *p, size_t n)
+{
+    const uint8_t *b = (const uint8_t *)p;
+    for (size_t i = 0; i < n; i++)
+        v.push_back(b[i]);
+}
+
+// FIXME endianness: append() copies host-order memory as-is (little-endian on x86),
+// but the JBIG2 spec uses big-endian fields. Wrap appends in explicit BE writers later.
 
 typedef enum {
     ORG_RANDOM_ACCESS,
@@ -67,7 +77,7 @@ Knubs knubs(void)
     return k;
 }
 
-uint8_t stream[0x1000];
+std::vector<uint8_t> stream;
 size_t stream_pos = 0;
 size_t g_segment_len = 0;
 
@@ -96,27 +106,21 @@ void genheader(Organization org, Knubs k)
         header_flags |= 8;
 
     printf("header_flags = 0x%02X (%u)\n", header_flags, header_flags);
-    memcpy(stream + stream_pos, &header_flags, sizeof(header_flags));
+    append(stream, &header_flags, sizeof(header_flags));
     stream_pos += sizeof(header_flags);
     if (k.page_number_known){
         uint32_t number_of_pages = urand();
         printf("number_of_pages = %u\n", number_of_pages);
-        memcpy(stream + stream_pos, &number_of_pages, sizeof(number_of_pages));
+        append(stream, &number_of_pages, sizeof(number_of_pages));
         stream_pos += sizeof(number_of_pages);
     }
 }
 
 void fill_random_pattern(uint8_t *buf, size_t len);
 
-uint8_t *gensegmentheader(size_t *out_len)
+std::vector<uint8_t> gensegmentheader(size_t *out_len)
 {
-    size_t header_cap = 0x10;
-    size_t header_pos = 0;
-    uint8_t *header_buf = malloc(header_cap);
-    if (header_buf == NULL) {
-        fprintf(stderr, "malloc failed\n");
-        return NULL;
-    }
+    std::vector<uint8_t> header_buf;
     uint32_t segment_number = urand();
     uint8_t segment_flags = urand() & 0xFF;
     uint8_t segment_type = segment_flags & 0x3F;
@@ -135,45 +139,92 @@ uint8_t *gensegmentheader(size_t *out_len)
 
     printf("segment number = %u\n", segment_number);
 
-    header_buf = realloc(header_buf, header_pos + sizeof(segment_number));
-    if (header_buf == NULL) {
-        fprintf(stderr, "realloc failed\n");
-        return NULL;
-    }
-    memcpy(header_buf + header_pos, &segment_number, sizeof(segment_number));
-    header_pos += sizeof(segment_number);
+    append(header_buf, &segment_number, sizeof(segment_number));
+    append(header_buf, &segment_flags, sizeof(segment_flags));
+    append(header_buf, &segment_data_length, sizeof(segment_data_length));
 
-    header_buf = realloc(header_buf, header_pos + sizeof(segment_flags));
-    if (header_buf == NULL) {
-        fprintf(stderr, "realloc failed\n");
-        return NULL;
-    }
-    memcpy(header_buf + header_pos, &segment_flags, sizeof(segment_flags));
-    header_pos += sizeof(segment_flags);
+    if (retrf_size == 1 ) {
 
-    header_buf = realloc(header_buf, header_pos + sizeof(segment_data_length));
-    if (header_buf == NULL) {
-        fprintf(stderr, "realloc failed\n");
-        return NULL;
-    }
-    memcpy(header_buf + header_pos, &segment_data_length, sizeof(segment_data_length));
-    header_pos += sizeof(segment_data_length);
+	    // get a rand u8
+	uint8_t retention_flags= (urand() & 0xFF) ;
+	   // get bits 5-7
+	uint8_t refs= rentention_flags & 0xE0;
+	  // shift right 
+	refs = refs >> 5 ;
+	
+	// we now adjust retention flags to match ref count
+	// we cant have the number of flags indicate more refs than the number indicated by the ref count value we bot eariler from retiontion_flags field 
+	if (refs < 4) {
+		// zero out bit 4
+	 retention_flags &= 0xEF ;
+	
+	}
+	if (refs < 3) {
+		// zero out bit 4-3
+	 retention_flags &= 0xE7;
+	
+	}
+	if (refs < 2) {
+		// zero out bit 4-2
+	 retention_flags &= 0xE3;
+	
+	}
+	if (refs < 1) {
+		// zero out bit 4-1
+	 retention_flags &= 0xE1 ;
+	}
 
-    header_buf = realloc(header_buf, header_pos + retrf_size);
-    if (header_buf == NULL) {
-        fprintf(stderr, "realloc failed\n");
-        return NULL;
-    }
-    if (R <= 4) {
-        header_buf[header_pos++] = urand() & 0xFF;
+	// even if the flags match the ref count , the retention bit could still possibly be set to zero  
+	// if the bit is set to zero on bit 0 , all other higher fields should logically be null
+	// we try to hold this logic true in the following checks
+	if (retention_flags & 0x01 == 0 ) {
+		// if bit0 is 0 zero out all bits 0- 4 
+	 retention_flags &= 0xE0 ;
+	}
+	if (retention_flags & 0x02 == 0 ) {
+		// if bit1 is 0 zero out all bits 1- 4 
+	 retention_flags &= 0xE1 ;
+	}
+	if (retention_flags & 0x04 == 0 ) {
+		// if bit2 is 0 zero out all bits 2- 4 
+	 retention_flags &= 0xE3 ;
+	}
+	if (retention_flags & 0x08 == 0 ) {
+		// if bit3 is 0 zero out all bits 3- 4 
+	 retention_flags &= 0xE7 ;
+	}
+	if (retention_flags & 0x10 == 0 ) {
+		// if bit4 is 0 zero out  bit  4 
+	 retention_flags &= 0xEF ;
+	}
+	
+
+	if (	
+        header_buf.push_back(retention_flags);
     } else {
-        fill_random_pattern(header_buf + header_pos, retrf_size);
-        header_pos += retrf_size;
+
+	uint32_t retention_flags= urand()  ;
+	// get first 28 bits
+	uint32_t refs= rentention_flags & 0x1FFFFFFF;
+	// set bits 31-29 to 1
+	 retention_flags |= 0xE0000000  ;
+// since the number of refs here is much higher i need some complex func to handle the switch case i did in the short 1 byte case 	
+
+	
+// once we finally set up retainment
+// WE REALLY NEED TO FIGURE OUT WHAT THE HELL RETAINMENT MEANS
+
+/*
+        size_t base = header_buf.size();
+        header_buf.resize(base + retrf_size);
+	
+        fill_random_pattern(header_buf.data() + base, retrf_size);
+*/
     }
 
     printf("segment header generated\n");
     if (out_len)
-        *out_len = header_pos;
+        *out_len = header_buf.size();
     return header_buf;
 }
 
@@ -183,17 +234,16 @@ void fill_random_pattern(uint8_t *buf, size_t len)
         buf[i] = urand() & 0xFF;
 }
 
-uint8_t *gensegmentdata(void)
+std::vector<uint8_t> gensegmentdata(void)
 {
-    static uint8_t data_buf[0x40];
-    static size_t data_pos = 0;
+    static std::vector<uint8_t> data_buf;
     printf("segment data generated\n");
     return data_buf;
 }
 
-uint8_t *gensegment(void)
+std::vector<uint8_t> gensegment(void)
 {
-    uint8_t *header_buf = gensegmentheader(&g_segment_len);
+    std::vector<uint8_t> header_buf = gensegmentheader(&g_segment_len);
     gensegmentdata();
     return header_buf;
 }
@@ -232,13 +282,12 @@ int main(void)
     }
     Knubs k = knubs();
     genheader(org, k);
-    uint8_t *seg = gensegment();
+    std::vector<uint8_t> seg = gensegment();
     if (k.colored_region)
         printf("Colored region\n");
-    hexdump(stream, stream_pos);
+    hexdump(stream.data(), stream_pos);
     bindump(stream[0]);
     printf("--\n");
-    hexdump(seg, g_segment_len);
-    free(seg);
+    hexdump(seg.data(), seg.size());
     return 0;
 }
