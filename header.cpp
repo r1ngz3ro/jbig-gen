@@ -217,6 +217,18 @@ void bindump(uint8_t byte)
     printf("\n");
 }
 
+void serialize_out(const uint8_t *buf, size_t len)
+{
+    FILE *f = fopen("out.jb2", "wb");
+    if (f == NULL) {
+        perror("fopen out.jb2");
+        return;
+    }
+    if (fwrite(buf, 1, len, f) != len)
+        perror("fwrite out.jb2");
+    fclose(f);
+}
+
 int main(void)
 {
     Organization org = choose_organisation();
@@ -233,7 +245,10 @@ int main(void)
     }
     Knubs k = knubs();
     genheader(org, k);
+    serialize_out(stream.data(), stream_pos);
     std::vector<uint8_t> seg = gensegment();
+    append(stream, seg.data(), seg.size());
+    stream_pos += seg.size();
     if (k.colored_region)
         printf("Colored region\n");
     hexdump(stream.data(), stream_pos);
