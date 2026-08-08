@@ -143,8 +143,8 @@ std::vector<uint8_t> gensegmentheader(size_t *out_len)
     uint32_t refs_out = urand();
     uint32_t R = refs_out;
     // FIXME: cap R to keep output sane; real size depends on the spec only, remove this later
-    if (R > 10)
-        R = 10;
+    if (R > 25)
+        R = 25;
 
     // 7.2.7  this special segment type has a very special pading to a very special case 
     uint32_t segment_data_length = (segment_type == SEG_IMMEDIATE_GENERIC)
