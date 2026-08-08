@@ -27,13 +27,25 @@ static void append(std::vector<uint8_t> &v, const void *p, size_t n)
         v.push_back(b[i]);
 }
 
-// FIXME endianness: append() copies host-order memory as-is (little-endian on x86),
-// but the JBIG2 spec uses big-endian fields. Wrap appends in explicit BE writers later.
+// JBIG2 is big-endian: every multi-byte field is most-significant byte first.
+static void put_be32(std::vector<uint8_t> &v, uint32_t x)
+{
+    v.push_back((uint8_t)(x >> 24));
+    v.push_back((uint8_t)(x >> 16));
+    v.push_back((uint8_t)(x >> 8));
+    v.push_back((uint8_t)x);
+}
+
+static void put_be16(std::vector<uint8_t> &v, uint16_t x)
+{
+    v.push_back((uint8_t)(x >> 8));
+    v.push_back((uint8_t)x);
+}
 
 typedef enum {
     ORG_RANDOM_ACCESS,
     ORG_SEQUENTIAL,
-    // not a real JBIG2 org type; reserved for future use
+    // not a real JBIG2 org type; embedded org has no JBIG2 file header (D.4)
     ORG_EMBEDDED
 } Organization;
 
@@ -78,8 +90,16 @@ Knubs knubs(void)
 }
 
 std::vector<uint8_t> stream;
-size_t stream_pos = 0;
+
 size_t g_segment_len = 0;
+
+// Two pointer streams filled from gensegment()'s output: one for the
+// header parts, one for the data parts, in generation order.
+// Note: order of creation is preserved, but Annex D.1/D.2 require segments
+// in increasing segment-number order, whereas gensegmentheader() picks the
+// segment number at random. TODO: assign increasing segment numbers.
+std::vector<std::vector<uint8_t> *> header_streams;
+std::vector<std::vector<uint8_t> *> data_streams;
 
 Organization choose_organisation(void)
 {
@@ -88,31 +108,28 @@ Organization choose_organisation(void)
 
 void genheader(Organization org, Knubs k)
 {
-    uint8_t header_flags = 0;
+    if (org == ORG_EMBEDDED) {
+        printf("embedded organisation has no file header (D.4)\n");
+        return;
+    }
 
-    if (org == ORG_SEQUENTIAL)
-        header_flags |= 1;
-    if (org == ORG_RANDOM_ACCESS)
-        header_flags = 0;
-
-    if (!k.page_number_known) {
-        header_flags |= 2;
-    } 
-
+    // D.4.2: file header flags.
+    uint8_t header_flags = (org == ORG_SEQUENTIAL) ? 0x01 : 0x00;
+    if (!k.page_number_known)
+        header_flags |= 0x02;
     if (k.use_12_AT)
-        header_flags |= 4;
-
+        header_flags |= 0x04;
     if (k.colored_region)
-        header_flags |= 8;
+        header_flags |= 0x08;
 
     printf("header_flags = 0x%02X (%u)\n", header_flags, header_flags);
-    append(stream, &header_flags, sizeof(header_flags));
-    stream_pos += sizeof(header_flags);
-    if (k.page_number_known){
-        uint32_t number_of_pages = urand();
+    stream.push_back(header_flags);
+
+    // D.4.3: number of pages; omitted when the count is unknown.
+    if (k.page_number_known) {
+        uint32_t number_of_pages = 1 + (urand() % 8);
         printf("number_of_pages = %u\n", number_of_pages);
-        append(stream, &number_of_pages, sizeof(number_of_pages));
-        stream_pos += sizeof(number_of_pages);
+        put_be32(stream, number_of_pages);
     }
 }
 
@@ -134,49 +151,79 @@ void write_retention_bits(std::vector<uint8_t> &out, uint32_t R)
     append(out, bits.data(), bits.size());
 }
 
-std::vector<uint8_t> gensegmentheader(size_t *out_len)
+// Produces a segment header. Field order (Figure 27 / 7.2.2-7.2.7):
+//   segment number, header flags, referred-to count + retention flags,
+//   referred-to segment numbers, page association, segment data length.
+std::vector<uint8_t> gensegmentheader(uint8_t segment_type, uint32_t data_len, size_t *out_len)
 {
-    std::vector<uint8_t> header_buf;
+    std::vector<uint8_t> hdr;
+
     uint32_t segment_number = urand();
-    uint8_t segment_flags = urand() & 0xFF;
-    uint8_t segment_type = segment_flags & 0x3F;
-    uint32_t refs_out = urand();
-    uint32_t R = refs_out;
-    // FIXME: cap R to keep output sane; real size depends on the spec only, remove this later
-    if (R > 25)
-        R = 25;
+    uint32_t R = urand() % 26;              // 0..25 referred-to segments
+    bool big_page = urand() & 1;            // page association field size
 
-    // 7.2.7  this special segment type has a very special pading to a very special case 
-    uint32_t segment_data_length = (segment_type == SEG_IMMEDIATE_GENERIC)
-                                       ? 0xffffffff
-                                       : urand();
+    // 7.2.3: segment header flags.
+    uint8_t flags = segment_type & 0x3F;    // bits 0-5: segment type
+    if (big_page)
+        flags |= 0x40;                      // bit 6: 4-byte page association
+    if (urand() & 1)
+        flags |= 0x80;                      // bit 7: deferred non-retain
 
-    printf("segment number = %u\n", segment_number);
+    // 7.2.7: immediate generic region may carry an unknown data length.
+    uint32_t seg_len = (segment_type == SEG_IMMEDIATE_GENERIC)
+                           ? 0xFFFFFFFFu
+                           : data_len;
 
-    append(header_buf, &segment_number, sizeof(segment_number));
-    append(header_buf, &segment_flags, sizeof(segment_flags));
-    append(header_buf, &segment_data_length, sizeof(segment_data_length));
+    printf("segment number = %u, type = %u, R = %u\n", segment_number, segment_type, R);
 
-    
-    if (R <= 4) {
-    // short form: 1 byte total. Top 3 bits = R, bottom bits = retain field.
+    put_be32(hdr, segment_number);
+    hdr.push_back(flags);
+
+    // 7.2.4: referred-to segment count and retention flags.
+    // short form: one byte, top 3 bits = R, bits 0-4 = retain bits.
     std::vector<uint8_t> retain;
-    write_retention_bits(retain, R);      // produces exactly 1 byte for R<=4
-    uint8_t b = (uint8_t)((R << 5) | (retain[0] & 0x1F));
-    header_buf.push_back(b);
-} else {
-    // long form: 4-byte count word (top 3 bits = 0b111, low 29 bits = R),
-    // followed by ceil((R+1)/8) bytes of retain bits.
-    uint32_t count_word = 0xE0000000u | (R & 0x1FFFFFFFu);
-    append(header_buf, &count_word, sizeof(count_word));   // still needs BE swap eventually
-    write_retention_bits(header_buf, R);
-}
+    write_retention_bits(retain, R);
+    if (R <= 4) {
+        hdr.push_back((uint8_t)((R << 5) | (retain[0] & 0x1F)));
+    } else {
+        // long form: bits 29-31 = 7, low 29 bits = R, then ceil((R+1)/8) bytes.
+        put_be32(hdr, 0xE0000000u | R);
+        append(hdr, retain.data(), retain.size());
+    }
 
-    printf("segment header generated\n");
-    hexdump(header_buf.data(), header_buf.size());
+    // 7.2.5: referred-to segment numbers. A segment may only refer to
+    // lower-numbered segments; its field size depends on its own number.
+    for (uint32_t i = 0; i < R; i++) {
+        uint32_t ref = segment_number ? (urand() % segment_number) : 0;
+        if (segment_number <= 256)
+            hdr.push_back((uint8_t)ref);
+        else if (segment_number <= 65536)
+            put_be16(hdr, (uint16_t)ref);
+        else
+            put_be32(hdr, ref);
+    }
+
+    // 7.2.6: page association. 0 = not associated with any page; 1 is the first page.
+    if (urand() & 1) {
+        if (big_page)
+            put_be32(hdr, 0);
+        else
+            hdr.push_back(0);
+    } else {
+        uint32_t page = 1 + (urand() & (big_page ? 0x0FFFFFFFu : 0xFFu));
+        if (big_page)
+            put_be32(hdr, page);
+        else
+            hdr.push_back((uint8_t)page);
+    }
+
+    put_be32(hdr, seg_len);
+
+    printf("segment header generated (%zu bytes)\n", hdr.size());
+    hexdump(hdr.data(), hdr.size());
     if (out_len)
-        *out_len = header_buf.size();
-    return header_buf;
+        *out_len = hdr.size();
+    return hdr;
 }
 
 void fill_random_pattern(uint8_t *buf, size_t len)
@@ -185,18 +232,55 @@ void fill_random_pattern(uint8_t *buf, size_t len)
         buf[i] = urand() & 0xFF;
 }
 
-std::vector<uint8_t> gensegmentdata(void)
+std::vector<uint8_t> gensegmentdata(uint32_t max_len)
 {
-    static std::vector<uint8_t> data_buf;
-    printf("segment data generated\n");
-    return data_buf;
+    uint32_t len = urand() % (max_len + 1);
+    std::vector<uint8_t> data(len);
+    fill_random_pattern(data.data(), len);
+    printf("segment data generated (%u bytes)\n", len);
+    return data;
 }
 
-std::vector<uint8_t> gensegment(void)
+std::vector<std::vector<uint8_t> *> gensegment(void)
 {
-    std::vector<uint8_t> header_buf = gensegmentheader(&g_segment_len);
-    gensegmentdata();
-    return header_buf;
+    static const uint8_t types[] = {
+        SEG_SYMBOL_DICTIONARY, SEG_INTERMEDIATE_TEXT, SEG_IMMEDIATE_TEXT,
+        SEG_IMMEDIATE_LOSSLESS_TEXT, SEG_PATTERN_DICTIONARY,
+        SEG_INTERMEDIATE_HALFTONE, SEG_IMMEDIATE_HALFTONE,
+        SEG_IMMEDIATE_LOSSLESS_HALFTONE, SEG_INTERMEDIATE_GENERIC,
+        SEG_IMMEDIATE_GENERIC, SEG_IMMEDIATE_LOSSLESS_GENERIC,
+        SEG_INTERMEDIATE_GENERIC_REFINEMENT, SEG_IMMEDIATE_GENERIC_REFINEMENT,
+        SEG_IMMEDIATE_LOSSLESS_GENERIC_REFINEMENT, SEG_PAGE_INFORMATION,
+        SEG_END_OF_PAGE, SEG_END_OF_STRIPE, SEG_END_OF_FILE,
+        SEG_PROFILES, SEG_TABLES, SEG_COLOUR_PALETTE, SEG_EXTENSION
+    };
+    uint8_t type = types[urand() % (sizeof(types) / sizeof(types[0]))];
+
+    // EOF / end-of-page / end-of-stripe segments carry no data.
+    bool has_data = type != SEG_END_OF_PAGE && type != SEG_END_OF_STRIPE
+                    && type != SEG_END_OF_FILE;
+
+    std::vector<uint8_t> data;
+    if (has_data)
+        data = gensegmentdata(256);
+    uint32_t data_len = (uint32_t)data.size();
+
+    if (type == SEG_IMMEDIATE_GENERIC) {
+        // 7.2.7: with an unknown data length the data part must end with the
+        // template-coding terminator 0xFF 0xAC plus a 4-byte row count.
+        static const uint8_t term[2] = { 0xFF, 0xAC };
+        append(data, term, sizeof(term));
+        put_be32(data, urand());
+        data_len = (uint32_t)data.size();
+    }
+
+    std::vector<uint8_t> *hdr = new std::vector<uint8_t>(
+        gensegmentheader(type, data_len, &g_segment_len));
+
+    std::vector<std::vector<uint8_t> *> parts;
+    parts.push_back(hdr);
+    parts.push_back(has_data ? new std::vector<uint8_t>(data) : nullptr);
+    return parts;
 }
 
 void hexdump(const uint8_t *buf, size_t len)
@@ -217,20 +301,50 @@ void bindump(uint8_t byte)
     printf("\n");
 }
 
-void serialize_out(const uint8_t *buf, size_t len)
+void serialize_out(const uint8_t *buf, size_t len, const char *path)
 {
-    FILE *f = fopen("out.jb2", "wb");
+    FILE *f = fopen(path, "wb");
     if (f == NULL) {
-        perror("fopen out.jb2");
+        perror("fopen");
         return;
     }
     if (fwrite(buf, 1, len, f) != len)
-        perror("fwrite out.jb2");
+        perror("fwrite");
     fclose(f);
 }
 
-int main(void)
+// Appends the two pointer streams into `stream` in the order dictated by
+// the file organization (Annex D.1 / D.2 / D.3).
+void assemble_org_order(Organization org)
 {
+    for (size_t i = 0; i < header_streams.size(); i++) {
+        if (header_streams[i])
+            append(stream, header_streams[i]->data(), header_streams[i]->size());
+        if (org == ORG_SEQUENTIAL || org == ORG_EMBEDDED)
+            if (data_streams[i])
+                append(stream, data_streams[i]->data(), data_streams[i]->size());
+    }
+    // Random access: every segment header first, then all segment data.
+    if (org == ORG_RANDOM_ACCESS)
+        for (size_t i = 0; i < data_streams.size(); i++)
+            if (data_streams[i])
+                append(stream, data_streams[i]->data(), data_streams[i]->size());
+}
+
+void free_streams(void)
+{
+    for (size_t i = 0; i < header_streams.size(); i++)
+        delete header_streams[i];
+    for (size_t i = 0; i < data_streams.size(); i++)
+        delete data_streams[i];
+    header_streams.clear();
+    data_streams.clear();
+}
+
+int main(int argc, char **argv)
+{
+    const char *out_path = (argc > 1) ? argv[1] : "out.jb2";
+
     Organization org = choose_organisation();
     switch (org) {
     case ORG_RANDOM_ACCESS:
@@ -245,15 +359,32 @@ int main(void)
     }
     Knubs k = knubs();
     genheader(org, k);
-    serialize_out(stream.data(), stream_pos);
-    std::vector<uint8_t> seg = gensegment();
-    append(stream, seg.data(), seg.size());
-    stream_pos += seg.size();
+
+    size_t nseg = 1 + (urand() % 4);
+    for (size_t i = 0; i < nseg; i++) {
+        std::vector<std::vector<uint8_t> *> seg = gensegment();
+        header_streams.push_back(seg[0]);
+        data_streams.push_back(seg[1]);
+    }
+
+    assemble_org_order(org);
+
+    serialize_out(stream.data(), stream.size(), out_path);
+
     if (k.colored_region)
         printf("Colored region\n");
-    hexdump(stream.data(), stream_pos);
-    bindump(stream[0]);
-    printf("--\n");
-    hexdump(seg.data(), seg.size());
+    hexdump(stream.data(), stream.size());
+    if (!stream.empty())
+        bindump(stream[0]);
+    for (size_t i = 0; i < header_streams.size(); i++) {
+        printf("--\n");
+        hexdump(header_streams[i]->data(), header_streams[i]->size());
+        if (data_streams[i]) {
+            printf("--\n");
+            hexdump(data_streams[i]->data(), data_streams[i]->size());
+        }
+    }
+
+    free_streams();
     return 0;
 }
