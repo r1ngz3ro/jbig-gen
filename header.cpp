@@ -117,6 +117,7 @@ void genheader(Organization org, Knubs k)
 }
 
 void fill_random_pattern(uint8_t *buf, size_t len);
+void hexdump(const uint8_t *buf, size_t len);
 
 // Writes the retain-bit field. R = number of referred-to segments.
 // Meaningful bits: bit 0 = retain-this-segment, bits 1..R = retain bits
@@ -145,8 +146,6 @@ std::vector<uint8_t> gensegmentheader(size_t *out_len)
     if (R > 10)
         R = 10;
 
-    size_t retrf_size = (R <= 4) ? 1 : 4 + ( (R + 1 + 7 ) / 8);
-
     // 7.2.7  this special segment type has a very special pading to a very special case 
     uint32_t segment_data_length = (segment_type == SEG_IMMEDIATE_GENERIC)
                                        ? 0xffffffff
@@ -174,6 +173,7 @@ std::vector<uint8_t> gensegmentheader(size_t *out_len)
 }
 
     printf("segment header generated\n");
+    hexdump(header_buf.data(), header_buf.size());
     if (out_len)
         *out_len = header_buf.size();
     return header_buf;
