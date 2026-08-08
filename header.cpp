@@ -118,6 +118,21 @@ void genheader(Organization org, Knubs k)
 
 void fill_random_pattern(uint8_t *buf, size_t len);
 
+// Writes the retain-bit field. R = number of referred-to segments.
+// Meaningful bits: bit 0 = retain-this-segment, bits 1..R = retain bits
+// for referred-to segments 1..R, in that order. Bits beyond R must be 0.
+void write_retention_bits(std::vector<uint8_t> &out, uint32_t R)
+{
+    size_t nbits  = R + 1;
+    size_t nbytes = (nbits + 7) / 8;
+    std::vector<uint8_t> bits(nbytes, 0);   // zero-init handles the "must be 0" part for free
+    for (size_t i = 0; i < nbits; i++) {
+        if (urand() & 1)
+            bits[i / 8] |= (1u << (i % 8));
+    }
+    append(out, bits.data(), bits.size());
+}
+
 std::vector<uint8_t> gensegmentheader(size_t *out_len)
 {
     std::vector<uint8_t> header_buf;
@@ -143,84 +158,20 @@ std::vector<uint8_t> gensegmentheader(size_t *out_len)
     append(header_buf, &segment_flags, sizeof(segment_flags));
     append(header_buf, &segment_data_length, sizeof(segment_data_length));
 
-    if (retrf_size == 1 ) {
-
-	    // get a rand u8
-	uint8_t retention_flags= (urand() & 0xFF) ;
-	   // get bits 5-7
-	uint8_t refs= rentention_flags & 0xE0;
-	  // shift right 
-	refs = refs >> 5 ;
-	
-	// we now adjust retention flags to match ref count
-	// we cant have the number of flags indicate more refs than the number indicated by the ref count value we bot eariler from retiontion_flags field 
-	if (refs < 4) {
-		// zero out bit 4
-	 retention_flags &= 0xEF ;
-	
-	}
-	if (refs < 3) {
-		// zero out bit 4-3
-	 retention_flags &= 0xE7;
-	
-	}
-	if (refs < 2) {
-		// zero out bit 4-2
-	 retention_flags &= 0xE3;
-	
-	}
-	if (refs < 1) {
-		// zero out bit 4-1
-	 retention_flags &= 0xE1 ;
-	}
-
-	// even if the flags match the ref count , the retention bit could still possibly be set to zero  
-	// if the bit is set to zero on bit 0 , all other higher fields should logically be null
-	// we try to hold this logic true in the following checks
-	if (retention_flags & 0x01 == 0 ) {
-		// if bit0 is 0 zero out all bits 0- 4 
-	 retention_flags &= 0xE0 ;
-	}
-	if (retention_flags & 0x02 == 0 ) {
-		// if bit1 is 0 zero out all bits 1- 4 
-	 retention_flags &= 0xE1 ;
-	}
-	if (retention_flags & 0x04 == 0 ) {
-		// if bit2 is 0 zero out all bits 2- 4 
-	 retention_flags &= 0xE3 ;
-	}
-	if (retention_flags & 0x08 == 0 ) {
-		// if bit3 is 0 zero out all bits 3- 4 
-	 retention_flags &= 0xE7 ;
-	}
-	if (retention_flags & 0x10 == 0 ) {
-		// if bit4 is 0 zero out  bit  4 
-	 retention_flags &= 0xEF ;
-	}
-	
-
-	if (	
-        header_buf.push_back(retention_flags);
-    } else {
-
-	uint32_t retention_flags= urand()  ;
-	// get first 28 bits
-	uint32_t refs= rentention_flags & 0x1FFFFFFF;
-	// set bits 31-29 to 1
-	 retention_flags |= 0xE0000000  ;
-// since the number of refs here is much higher i need some complex func to handle the switch case i did in the short 1 byte case 	
-
-	
-// once we finally set up retainment
-// WE REALLY NEED TO FIGURE OUT WHAT THE HELL RETAINMENT MEANS
-
-/*
-        size_t base = header_buf.size();
-        header_buf.resize(base + retrf_size);
-	
-        fill_random_pattern(header_buf.data() + base, retrf_size);
-*/
-    }
+    
+    if (R <= 4) {
+    // short form: 1 byte total. Top 3 bits = R, bottom bits = retain field.
+    std::vector<uint8_t> retain;
+    write_retention_bits(retain, R);      // produces exactly 1 byte for R<=4
+    uint8_t b = (uint8_t)((R << 5) | (retain[0] & 0x1F));
+    header_buf.push_back(b);
+} else {
+    // long form: 4-byte count word (top 3 bits = 0b111, low 29 bits = R),
+    // followed by ceil((R+1)/8) bytes of retain bits.
+    uint32_t count_word = 0xE0000000u | (R & 0x1FFFFFFFu);
+    append(header_buf, &count_word, sizeof(count_word));   // still needs BE swap eventually
+    write_retention_bits(header_buf, R);
+}
 
     printf("segment header generated\n");
     if (out_len)
