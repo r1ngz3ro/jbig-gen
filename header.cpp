@@ -4,20 +4,43 @@
 #include <cstring>
 #include <vector>
 
-uint32_t urand(void)
+// xorshift32 PRNG. Seeded once from /dev/urandom and never returns to the
+// kernel, unlike the previous per-call urandom read which dominated
+// generation cost (~5.7s/1k samples).
+static uint32_t prng_state;
+
+static uint32_t xorshift32(void)
 {
-    uint32_t v;
+    uint32_t x = prng_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    prng_state = x;
+    return x;
+}
+
+// Seeds the PRNG from /dev/urandom; exits on failure.
+void urand_init(void)
+{
     FILE *f = fopen("/dev/urandom", "r");
     if (f == NULL) {
         perror("/dev/urandom");
         exit(1);
     }
-    if (fread(&v, sizeof(v), 1, f) != 1) {
+    uint32_t seed;
+    if (fread(&seed, sizeof(seed), 1, f) != 1) {
         perror("fread /dev/urandom");
         exit(1);
     }
     fclose(f);
-    return v;
+    if (seed == 0)
+        seed = 0x6D2B79F5u; // xorshift state must be nonzero
+    prng_state = seed;
+}
+
+uint32_t urand(void)
+{
+    return xorshift32();
 }
 
 static void append(std::vector<uint8_t> &v, const void *p, size_t n)
@@ -232,8 +255,186 @@ void fill_random_pattern(uint8_t *buf, size_t len)
         buf[i] = urand() & 0xFF;
 }
 
-std::vector<uint8_t> gensegmentdata(uint32_t max_len)
+// A segment-data handler builds the data part for one segment type.
+// Table is indexed by SegmentType; entries that are nullptr are
+// "unimplemented" and gensegmentdata() falls back to random bytes.
+typedef std::vector<uint8_t> (*SegHandler)(void);
+
+std::vector<uint8_t> gen_segment_page_info(void);
+std::vector<uint8_t> gen_segment_extension(void);
+std::vector<uint8_t> gen_segment_pattern_dict(void);
+std::vector<uint8_t> gen_segment_region_info(void);
+
+static const size_t SEG_HANDLER_COUNT = 63;
+static SegHandler seg_handlers[SEG_HANDLER_COUNT] = { nullptr };
+
+void init_seg_handlers(void)
 {
+    seg_handlers[SEG_PAGE_INFORMATION] = gen_segment_page_info;
+    seg_handlers[SEG_EXTENSION] = gen_segment_extension;
+    seg_handlers[SEG_PATTERN_DICTIONARY] = gen_segment_pattern_dict;
+
+    seg_handlers[SEG_INTERMEDIATE_TEXT] = gen_segment_region_info;
+    seg_handlers[SEG_IMMEDIATE_TEXT] = gen_segment_region_info;
+    seg_handlers[SEG_IMMEDIATE_LOSSLESS_TEXT] = gen_segment_region_info;
+    seg_handlers[SEG_INTERMEDIATE_HALFTONE] = gen_segment_region_info;
+    seg_handlers[SEG_IMMEDIATE_HALFTONE] = gen_segment_region_info;
+    seg_handlers[SEG_IMMEDIATE_LOSSLESS_HALFTONE] = gen_segment_region_info;
+    seg_handlers[SEG_INTERMEDIATE_GENERIC] = gen_segment_region_info;
+    seg_handlers[SEG_IMMEDIATE_GENERIC] = gen_segment_region_info;
+    seg_handlers[SEG_IMMEDIATE_LOSSLESS_GENERIC] = gen_segment_region_info;
+    seg_handlers[SEG_INTERMEDIATE_GENERIC_REFINEMENT] = gen_segment_region_info;
+    seg_handlers[SEG_IMMEDIATE_GENERIC_REFINEMENT] = gen_segment_region_info;
+    seg_handlers[SEG_IMMEDIATE_LOSSLESS_GENERIC_REFINEMENT] = gen_segment_region_info;
+}
+
+// 7.4.1: region segment information field (Figure 30). This common
+// 17-byte prefix opens the data part of every region segment (text,
+// halftone, generic, generic refinement). Field order:
+//   width, height, X location, Y location, flags.
+std::vector<uint8_t> gen_segment_region_info(void)
+{
+    std::vector<uint8_t> d;
+    // Keep the size/location fields within 16 bits so regions stay
+    // plausible next to the page size reported by gen_segment_page_info()
+    // (itself capped at 1 + urand()%0x10000).
+    put_be32(d, 1 + (urand() % 0x10000));     // 7.4.1.1: bitmap width
+    put_be32(d, 1 + (urand() % 0x10000));     // 7.4.1.2: bitmap height
+    put_be32(d, urand() & 0xFFFF);            // 7.4.1.3: X location
+    put_be32(d, urand() & 0xFFFF);            // 7.4.1.4: Y location
+    // 7.4.1.5 flags: bits 0-2 external combination operator (0 OR,
+    // 1 AND, 2 XOR, 3 XNOR, 4 REPLACE); bit 3 COLEXTFLAG; bits 4-7
+    // reserved, must be 0.
+    bool color = (urand() & 1) != 0;
+    uint8_t flags = color ? 4 : (uint8_t)(urand() % 5); // COLEXTFLAG -> REPLACE (Note 3)
+    if (color)
+        flags |= 0x08;
+    d.push_back(flags);
+    printf("region-info handler (%zu bytes)\n", d.size());
+    return d;
+}
+
+// 4.4.1: page information data part.
+std::vector<uint8_t> gen_segment_page_info(void)
+{
+    std::vector<uint8_t> d;
+    put_be32(d, 1 + (urand() % 0x10000));     // page width
+    put_be32(d, 1 + (urand() % 0x10000));     // page height
+    put_be32(d, 1 + (urand() % 300));         // x resolution
+    put_be32(d, 1 + (urand() % 300));         // y resolution
+    d.push_back((urand() & 1) ? 0x80 : 0x00); // page flags: default pixel value
+    d.push_back((uint8_t)(urand() % 0xFF));   // stripe size
+    printf("page-info handler (%zu bytes)\n", d.size());
+    return d;
+}
+
+// 4.4.8: extension segment data part (2-byte extension type).
+std::vector<uint8_t> gen_segment_extension(void)
+{
+    std::vector<uint8_t> d;
+    put_be16(d, (uint16_t)(urand() & 0xFFFE));
+    printf("extension handler (%zu bytes)\n", d.size());
+    return d;
+}
+
+// 4.4.2: pattern dictionary segment data header (Figure 41).
+std::vector<uint8_t> gen_segment_pattern_dict(void)
+{
+    std::vector<uint8_t> d;
+    bool mmr = (urand() & 1) != 0;
+    // 4.4.2.1.1 flag: bit 0 HDMMR, bits 1-2 HDTEMPLATE; HDTEMPLATE must be
+    // 0 when HDMMR is set. Bits 3-7 reserved, always 0.
+    uint8_t flags = mmr ? 0x01 : 0x00;
+    if (!mmr)
+        flags |= (uint8_t)((urand() % 4) << 1);
+    d.push_back(flags);
+    d.push_back((uint8_t)(1 + (urand() % 0xFF)));   // HDPW, must be > 0
+    d.push_back((uint8_t)(1 + (urand() % 0xFF)));   // HDPH, must be > 0
+    put_be32(d, 1 + (urand() % 0x10000));           // GRAYMAX = npatterns - 1
+    printf("pattern-dictionary handler (%zu bytes)\n", d.size());
+    return d;
+}
+
+std::vector<uint8_t> gensegmentdata(uint8_t segment_type, uint32_t max_len)
+{
+    SegHandler handler = nullptr;
+    switch (segment_type) {
+    case SEG_SYMBOL_DICTIONARY:
+        handler = seg_handlers[SEG_SYMBOL_DICTIONARY];
+        break;
+    case SEG_INTERMEDIATE_TEXT:
+        handler = seg_handlers[SEG_INTERMEDIATE_TEXT];
+        break;
+    case SEG_IMMEDIATE_TEXT:
+        handler = seg_handlers[SEG_IMMEDIATE_TEXT];
+        break;
+    case SEG_IMMEDIATE_LOSSLESS_TEXT:
+        handler = seg_handlers[SEG_IMMEDIATE_LOSSLESS_TEXT];
+        break;
+    case SEG_PATTERN_DICTIONARY:
+        handler = seg_handlers[SEG_PATTERN_DICTIONARY];
+        break;
+    case SEG_INTERMEDIATE_HALFTONE:
+        handler = seg_handlers[SEG_INTERMEDIATE_HALFTONE];
+        break;
+    case SEG_IMMEDIATE_HALFTONE:
+        handler = seg_handlers[SEG_IMMEDIATE_HALFTONE];
+        break;
+    case SEG_IMMEDIATE_LOSSLESS_HALFTONE:
+        handler = seg_handlers[SEG_IMMEDIATE_LOSSLESS_HALFTONE];
+        break;
+    case SEG_INTERMEDIATE_GENERIC:
+        handler = seg_handlers[SEG_INTERMEDIATE_GENERIC];
+        break;
+    case SEG_IMMEDIATE_GENERIC:
+        handler = seg_handlers[SEG_IMMEDIATE_GENERIC];
+        break;
+    case SEG_IMMEDIATE_LOSSLESS_GENERIC:
+        handler = seg_handlers[SEG_IMMEDIATE_LOSSLESS_GENERIC];
+        break;
+    case SEG_INTERMEDIATE_GENERIC_REFINEMENT:
+        handler = seg_handlers[SEG_INTERMEDIATE_GENERIC_REFINEMENT];
+        break;
+    case SEG_IMMEDIATE_GENERIC_REFINEMENT:
+        handler = seg_handlers[SEG_IMMEDIATE_GENERIC_REFINEMENT];
+        break;
+    case SEG_IMMEDIATE_LOSSLESS_GENERIC_REFINEMENT:
+        handler = seg_handlers[SEG_IMMEDIATE_LOSSLESS_GENERIC_REFINEMENT];
+        break;
+    case SEG_PAGE_INFORMATION:
+        handler = seg_handlers[SEG_PAGE_INFORMATION];
+        break;
+    case SEG_END_OF_PAGE:
+        handler = seg_handlers[SEG_END_OF_PAGE];
+        break;
+    case SEG_END_OF_STRIPE:
+        handler = seg_handlers[SEG_END_OF_STRIPE];
+        break;
+    case SEG_END_OF_FILE:
+        handler = seg_handlers[SEG_END_OF_FILE];
+        break;
+    case SEG_PROFILES:
+        handler = seg_handlers[SEG_PROFILES];
+        break;
+    case SEG_TABLES:
+        handler = seg_handlers[SEG_TABLES];
+        break;
+    case SEG_COLOUR_PALETTE:
+        handler = seg_handlers[SEG_COLOUR_PALETTE];
+        break;
+    case SEG_EXTENSION:
+        handler = seg_handlers[SEG_EXTENSION];
+        break;
+    default:
+        break;
+    }
+
+    // Unimplemented (null) handlers are skipped: fall back to random data.
+    if (handler != nullptr) {
+        std::vector<uint8_t> data = handler();
+        return data;
+    }
+
     uint32_t len = urand() % (max_len + 1);
     std::vector<uint8_t> data(len);
     fill_random_pattern(data.data(), len);
@@ -262,7 +463,7 @@ std::vector<std::vector<uint8_t> *> gensegment(void)
 
     std::vector<uint8_t> data;
     if (has_data)
-        data = gensegmentdata(256);
+        data = gensegmentdata(type, 256);
     uint32_t data_len = (uint32_t)data.size();
 
     if (type == SEG_IMMEDIATE_GENERIC) {
@@ -341,10 +542,18 @@ void free_streams(void)
     data_streams.clear();
 }
 
+// Master init: everything that must happen before generation starts.
+void init_all(void)
+{
+    urand_init();
+    init_seg_handlers();
+}
+
 int main(int argc, char **argv)
 {
     const char *out_path = (argc > 1) ? argv[1] : "out.jb2";
 
+    init_all();
     Organization org = choose_organisation();
     switch (org) {
     case ORG_RANDOM_ACCESS:
