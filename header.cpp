@@ -1767,6 +1767,33 @@ std::vector<uint8_t> g_page_bitmap;
 // stops at the first failing segment), so the page state after it is moot;
 // this only stops a later segment from *claiming* to know it.
 bool g_page_state_known = true;
+// 7.4.8.2: the page information segment may declare its bitmap height
+// unknown (0xFFFFFFFF), leaving it to be settled later. 7.4.8.6 then forces
+// the "page is striped" bit to 1, and the maximum stripe size becomes the
+// height a decoder starts from.
+//
+// Whether the page then *grows* depends on the embedder, not the file.
+// pdfium only expands a striped page when it allocated the page itself
+// (every such site is behind `if (!buf_specified_)`), and buf_specified_ is
+// set by GetFirstPage(), which is the only way its public API decodes a page
+// -- so a caller that hands in a buffer, as PDF rendering and this
+// toolchain's harness both do, gets a fixed page of max-stripe-size rows
+// with everything below it clipped. That is what the model mirrors here.
+// Ghostscript jbig2dec, which allocates its own page, really does resize
+// (jbig2_page.c:294), so the two disagree on the final height for these
+// files -- an embedder-API artifact rather than a decoder bug. pdfium also
+// ignores end of stripe segments entirely (jbig2_context.cpp:391 skips their
+// data).
+bool g_page_height_unknown = false;
+// 7.4.8.6's two striping fields, and the running end row used to keep
+// successive end of stripe segments legal. Chosen with the geometry rather
+// than inside the page information handler, because that handler runs after
+// the content loop (its flags are derived from the content), by which time
+// any end of stripe segment has already had to know the maximum stripe size
+// it must not exceed.
+bool g_page_striped = false;
+uint32_t g_page_max_stripe = 0;
+uint32_t g_last_stripe_end = 0;
 
 // 7.3.1: "An intermediate region segment may only be referred to by one
 // other non-extension segment; it may be referred to by any number of
@@ -1800,6 +1827,7 @@ static void page_state_init(uint32_t width, uint32_t height, bool default_pixel)
     g_page_state_known = true;
 }
 
+
 // Draws 7.4.8.1/.2's page width and height, and 7.4.8.5 bit 2's default
 // pixel value. Unlike a region's declared size, these drive an actual
 // page-buffer allocation, so the *product* matters: two independent
@@ -1819,6 +1847,21 @@ static void choose_page_geometry(void)
     if (max_height > 0x10000)
         max_height = 0x10000;
     uint32_t height = 1 + (urand() % max_height);
+    // A quarter of the time the height is left unknown. The buffer a decoder
+    // starts from is then the maximum stripe size (7.4.8.6, 15 bits), so that
+    // is what the model starts at too; regions below it grow both.
+    g_page_height_unknown = (urand() % 4 == 0);
+    g_last_stripe_end = 0;
+    if (g_page_height_unknown) {
+        uint32_t cap = max_height < 0x8000 ? max_height : 0x7FFF;
+        g_page_max_stripe = 1 + (urand() % (cap ? cap : 1));
+        height = g_page_max_stripe;
+    } else {
+        g_page_max_stripe = (uint32_t)(urand() % 0x8000);
+    }
+    // 7.4.8.6: "If the page's bitmap height is unknown ... then the page is
+    // striped bit must be 1."
+    g_page_striped = g_page_height_unknown || (urand() & 1) != 0;
     page_state_init(width, height, (urand() & 1) != 0);
 }
 
@@ -2424,7 +2467,8 @@ SegResult gen_segment_page_info(const std::vector<GeneratedSegment> &prior)
     // region placement has to be able to aim at a page that already has a
     // size. This segment only reports them.
     put_be32(d, g_page_width);
-    put_be32(d, g_page_height);
+    // 7.4.8.2: 0xFFFFFFFF when the height is not yet known.
+    put_be32(d, g_page_height_unknown ? 0xFFFFFFFFu : g_page_height);
     put_be32(d, 1 + (urand() % 300));         // x resolution
     put_be32(d, 1 + (urand() % 300));         // y resolution
 
@@ -2509,8 +2553,13 @@ SegResult gen_segment_page_info(const std::vector<GeneratedSegment> &prior)
 
     // 7.4.8.6 page striping information (2 bytes): bit 15 page is striped,
     // bits 0-14 maximum stripe size.
-    bool striped = (urand() & 1) != 0;
-    uint16_t striping = (uint16_t)(urand() % 0x8000);
+    // 7.4.8.6 page striping information: bit 15 "page is striped", bits 0-14
+    // the maximum stripe size. Both were settled by choose_page_geometry();
+    // for an unknown-height page the maximum stripe size is also the height a
+    // decoder allocates, so it has to be the one the model started from
+    // rather than a free draw here.
+    bool striped = g_page_striped;
+    uint16_t striping = (uint16_t)g_page_max_stripe;
     if (striped)
         striping |= 0x8000;
     put_be16(d, striping);
@@ -5022,8 +5071,22 @@ SegResult gen_segment_profiles(const std::vector<GeneratedSegment> &)
 SegResult gen_segment_end_of_stripe(const std::vector<GeneratedSegment> &)
 {
     std::vector<uint8_t> d;
-    put_be32(d, urand() % 0x10000);
-    printf("end-of-stripe handler (%zu bytes)\n", d.size());
+    // 7.4.10 + 7.4.8.6: on a striped page the gap between one stripe's end
+    // row and the previous one's must not exceed the page's maximum stripe
+    // size, so walk the end row forward within that bound instead of drawing
+    // it freely. An unstriped page has no such companion field to honour.
+    uint32_t end_row;
+    if (g_page_striped) {
+        uint32_t step = g_page_max_stripe ? 1 + (urand() % g_page_max_stripe) : 1;
+        end_row = g_last_stripe_end + step;
+        if (g_page_height && end_row > g_page_height - 1)
+            end_row = g_page_height - 1;
+        g_last_stripe_end = end_row;
+    } else {
+        end_row = urand() % 0x10000;
+    }
+    put_be32(d, end_row);
+    printf("end-of-stripe handler (%zu bytes, end row %u)\n", d.size(), end_row);
     return { d, {} };
 }
 
@@ -5921,6 +5984,18 @@ int main(int argc, char **argv)
         gensegment(SEG_PAGE_INFORMATION, 1, page_info_number);
     header_streams.insert(header_streams.begin() + page_info_pos, page_info[0]);
     data_streams.insert(data_streams.begin() + page_info_pos, page_info[1]);
+
+    // 7.4.9: "If a page's height was originally unknown, then there must be
+    // at least one end of stripe segment associated with the page. In this
+    // case, the end row of that last stripe is the last row of the page
+    // bitmap and no region segment may occur between the last end of stripe
+    // segment and the end of page segment." Emitting it here, immediately
+    // before the end of page segment, satisfies both halves at once.
+    if (g_page_height_unknown) {
+        g_last_stripe_end = g_page_height ? g_page_height - 1 : 0;
+        std::vector<std::vector<uint8_t> *> eos = gensegment(SEG_END_OF_STRIPE, 1);
+        push_segment(eos);
+    }
 
     // 7.4.9: each page must have exactly one end of page segment associated
     // with it, and it must be the last segment associated with that page.
