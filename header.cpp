@@ -3222,16 +3222,17 @@ SegResult gen_segment_symbol_dict(const std::vector<GeneratedSegment> &prior)
     bool sdhuff = (urand() & 1) != 0;
     bool sdrefagg = (urand() & 1) != 0;
 
+    std::vector<uint32_t> real_dict_pool;
+    for (const auto &seg : prior)
+        if (seg.type == SEG_SYMBOL_DICTIONARY && seg.num_symbols > 0 && !seg.symbols.empty())
+            real_dict_pool.push_back(seg.number);
+    if (real_dict_pool.empty())
+        sdrefagg = false;
+
     if (sdrefagg) {
-        std::vector<uint32_t> real_dict_pool;
-        for (const auto &seg : prior)
-            if (seg.type == SEG_SYMBOL_DICTIONARY && seg.num_symbols > 0 && !seg.symbols.empty())
-                real_dict_pool.push_back(seg.number);
-        if (!real_dict_pool.empty()) {
-            std::vector<uint32_t> chosen = pick_refs(real_dict_pool, 1, 1);
-            return sdhuff ? gen_symbol_dict_real_refagg(prior, chosen[0])
-                          : gen_symbol_dict_real_refagg_arith(prior, chosen[0]);
-        }
+        std::vector<uint32_t> chosen = pick_refs(real_dict_pool, 1, 1);
+        return sdhuff ? gen_symbol_dict_real_refagg(prior, chosen[0])
+                      : gen_symbol_dict_real_refagg_arith(prior, chosen[0]);
     }
 
     if (sdhuff && !sdrefagg)
