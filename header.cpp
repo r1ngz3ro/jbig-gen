@@ -5359,6 +5359,178 @@ SegResult gensegmentdata(uint8_t segment_type, uint32_t max_len, const std::vect
 // (bumping the counter) before generating content, then build that
 // segment's bytes afterward once it can see that content in `prior` — see
 // how main() builds the page information segment.
+// ---------------------------------------------------------------------------
+// Negative-test mutations (--mutate).
+//
+// Each of these breaks one specific rule, on a file that is otherwise a
+// well-formed product of the ordered planner. That is the whole reason the
+// DAG and the linearizer are kept apart: a violation becomes a one-line
+// perturbation of a known-good structure rather than undifferentiated noise,
+// and the rule it breaks is known in advance, so a decoder's response can be
+// judged rather than merely observed.
+//
+// Exactly one mutation fires per file, and the page model is retired when it
+// does -- a mutated file is not something this generator can predict the
+// decode of, so the page oracle must not compare it.
+//
+// Value varies a lot by rule, and it is worth being honest about which is
+// which. Anything violating 7.2.5 (self-reference, forward reference, a
+// cycle) dies on one integer comparison in PDFium's ParseSegmentHeader before
+// a byte of segment data is read; those make cheap conformance assertions but
+// poor fuzzing, because almost no decoder surface runs. The ones that earn
+// their keep are the shapes that survive header parsing and fail somewhere
+// inside the decode -- a dangling reference, a wrong-type referent, a
+// duplicated claim on an intermediate region -- and the ones where the two
+// decoders provably disagree, which is where a differential run has something
+// to say.
+enum MutationKind {
+    MUT_NONE = 0,
+    MUT_SELF_REF,        // 7.2.5  refer to own segment number
+    MUT_FORWARD_REF,     // 7.2.5  refer to a higher segment number
+    MUT_DANGLING_REF,    // refer to a lower number that was never emitted
+    MUT_WRONG_TYPE_REF,  // 7.3.1  referent exists but is the wrong type
+    MUT_DUPLICATE_EDGE,  // 7.3.1  a second claim on one intermediate region
+    MUT_CROSS_PAGE_REF,  // 7.2.6  referent belongs to another page
+    MUT_DUP_SEG_NUMBER,  // reuse an earlier segment number (aliasing)
+    MUT_RESERVED_TYPE,   // 7.3    a segment type the spec reserves
+    MUT_PAGE_INFO_LATE,  // 7.4.8  page information is not the page's first
+    MUT_EOP_EARLY,       // 7.4.9  a region segment follows the end of page
+    MUT_KIND_COUNT
+};
+
+static const char *mutation_name(MutationKind k)
+{
+    switch (k) {
+    case MUT_SELF_REF:       return "self-ref";
+    case MUT_FORWARD_REF:    return "forward-ref";
+    case MUT_DANGLING_REF:   return "dangling-ref";
+    case MUT_WRONG_TYPE_REF: return "wrong-type-ref";
+    case MUT_DUPLICATE_EDGE: return "duplicate-edge";
+    case MUT_CROSS_PAGE_REF: return "cross-page-ref";
+    case MUT_DUP_SEG_NUMBER: return "dup-segment-number";
+    case MUT_RESERVED_TYPE:  return "reserved-type";
+    case MUT_PAGE_INFO_LATE: return "page-info-late";
+    case MUT_EOP_EARLY:      return "end-of-page-early";
+    default:                 return "none";
+    }
+}
+
+// Which mutation this run applies, and whether it has already fired. Both are
+// per-file: main() picks one up front and the first segment able to carry it
+// takes it.
+MutationKind g_mutation = MUT_NONE;
+bool g_mutation_fired = false;
+
+// Every segment ever emitted this file, surviving the per-page pool reset that
+// 7.2.6 forces on g_prior_segments -- MUT_CROSS_PAGE_REF needs to reach a page
+// that is already finished, which is precisely what that reset hides.
+struct EmittedSegment {
+    uint32_t number;
+    uint32_t page;
+    uint8_t type;
+};
+std::vector<EmittedSegment> g_all_segments;
+
+// Applies this file's chosen mutation to a segment about to be written, if
+// this segment can carry it. Returns true when it fired. Everything here
+// rewrites the *header* -- referred-to numbers, the segment number, the type
+// field -- leaving the data part exactly as its handler produced it, so the
+// file stays plausible right up to the rule it breaks.
+static bool apply_mutation(uint8_t &type, uint32_t &segment_number,
+                            std::vector<uint32_t> &refs, int32_t page)
+{
+    switch (g_mutation) {
+    case MUT_SELF_REF:
+        refs.assign(1, segment_number);
+        return true;
+
+    case MUT_FORWARD_REF:
+        refs.assign(1, segment_number + 1 + (urand() % 4));
+        return true;
+
+    case MUT_DANGLING_REF: {
+        // Segment numbers are handed out contiguously, so every number below
+        // this one exists and no reference can dangle by accident. Burn this
+        // segment's number, take the next one, and point at the hole: a
+        // reference that is properly *lower* (so 7.2.5 is satisfied and the
+        // header parses) but resolves to nothing.
+        uint32_t hole = segment_number;
+        segment_number = g_next_segment_number++;
+        refs.assign(1, hole);
+        return true;
+    }
+
+    case MUT_WRONG_TYPE_REF: {
+        // A referent that exists and parses, but is not a type this referrer
+        // may point at -- the case type gates are supposed to catch, and the
+        // one that reaches furthest into a decoder before being noticed.
+        std::vector<uint32_t> wrong;
+        for (const auto &sg : g_prior_segments)
+            if (sg.number < segment_number && sg.type != type &&
+                std::find(refs.begin(), refs.end(), sg.number) == refs.end())
+                wrong.push_back(sg.number);
+        if (wrong.empty())
+            return false;
+        refs.assign(1, wrong[urand() % wrong.size()]);
+        return true;
+    }
+
+    case MUT_DUPLICATE_EDGE: {
+        // 7.3.1 allows an intermediate region only one non-extension
+        // referrer. Point a second segment at one already spoken for, which
+        // is the shape that exercises jbig2dec's image refcounting where
+        // PDFium only has a unique_ptr to hand out.
+        if (g_claimed_intermediate_regions.empty())
+            return false;
+        uint32_t victim = g_claimed_intermediate_regions[
+            urand() % g_claimed_intermediate_regions.size()];
+        if (victim >= segment_number)
+            return false;
+        refs.assign(1, victim);
+        return true;
+    }
+
+    case MUT_CROSS_PAGE_REF: {
+        std::vector<uint32_t> other;
+        for (const auto &sg : g_all_segments)
+            if (sg.page != 0 && (int32_t)sg.page != page && sg.number < segment_number)
+                other.push_back(sg.number);
+        if (other.empty())
+            return false;
+        refs.assign(1, other[urand() % other.size()]);
+        return true;
+    }
+
+    case MUT_DUP_SEG_NUMBER: {
+        // Not a rule violation the spec names, but nothing forbids it either,
+        // and the two decoders resolve a duplicate differently: PDFium's
+        // FindSegmentByNumber returns the first match, jbig2dec's scans
+        // backwards and returns the most recent. Every reference to this
+        // number then means a different object in the two.
+        if (g_all_segments.empty())
+            return false;
+        uint32_t dup = g_all_segments[urand() % g_all_segments.size()].number;
+        if (dup >= segment_number)
+            return false;
+        segment_number = dup;
+        return true;
+    }
+
+    case MUT_RESERVED_TYPE:
+        // 7.3: "All other segment types are reserved and must not be used."
+        // The data part stays whatever its real handler produced, so this is a
+        // reserved type carrying an entirely plausible payload. PDFium accepts
+        // and skips it; jbig2dec logs an unknown-type warning.
+        if (refs.empty() && type != SEG_IMMEDIATE_GENERIC)
+            return false;
+        type = (uint8_t)(55 + (urand() % 5));   // 55-59, all reserved
+        return true;
+
+    default:
+        return false;
+    }
+}
+
 std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t forced_page = -1,
                                                 int64_t forced_number = -1)
 {
@@ -5551,6 +5723,18 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
         data_len = (uint32_t)data.size();
     }
 
+    // One mutation per file, taken by the first segment able to carry it.
+    // The page model cannot predict a mutated decode, so it retires here
+    // rather than reporting a page the oracle would then mis-flag.
+    if (g_mutation != MUT_NONE && !g_mutation_fired && type != SEG_PAGE_INFORMATION) {
+        if (apply_mutation(type, segment_number, refs, forced_page)) {
+            g_mutation_fired = true;
+            g_page_state_known = false;
+            printf("MUTATION %s applied to segment %u (type %u, %zu refs)\n",
+                   mutation_name(g_mutation), segment_number, type, refs.size());
+        }
+    }
+
     std::vector<uint8_t> *hdr = new std::vector<uint8_t>(
         gensegmentheader(type, segment_number, refs, data_len, &g_segment_len, forced_page,
                          unknown_len));
@@ -5558,6 +5742,8 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
     // Make this segment visible to later gensegment() calls as a possible
     // referent, now that its own refs (which could only point to earlier
     // segments) are settled.
+    g_all_segments.push_back({ segment_number,
+                               (uint32_t)(forced_page >= 0 ? forced_page : 0), type });
     if (ext_template)
         g_any_ext_template = true;
     if (colored)
@@ -5817,12 +6003,32 @@ int main(int argc, char **argv)
             header_mode = HEADER_FORCE_OFF;
         } else if (strcmp(argv[i], "--ordered") == 0) {
             ordered_mode = true;
+        } else if (strncmp(argv[i], "--mutate", 8) == 0 &&
+                   (argv[i][8] == '\0' || argv[i][8] == '=')) {
+            // --mutate picks one at random; --mutate=<name> pins it, which is
+            // what a differential run wants when it is chasing one rule.
+            ordered_mode = true;
+            if (argv[i][8] == '=') {
+                const char *want = argv[i] + 9;
+                for (int m = 1; m < MUT_KIND_COUNT; m++)
+                    if (strcmp(want, mutation_name((MutationKind)m)) == 0)
+                        g_mutation = (MutationKind)m;
+                if (g_mutation == MUT_NONE) {
+                    fprintf(stderr, "unknown mutation '%s'; known:", want);
+                    for (int m = 1; m < MUT_KIND_COUNT; m++)
+                        fprintf(stderr, " %s", mutation_name((MutationKind)m));
+                    fprintf(stderr, "\n");
+                    return 1;
+                }
+            } else {
+                g_mutation = (MutationKind)(1 + (urand() % (MUT_KIND_COUNT - 1)));
+            }
         } else if (strcmp(argv[i], "--dump-page") == 0 && i + 1 < argc) {
             dump_page_path = argv[++i];
         } else if (argv[i][0] == '-' || out_path_set) {
             fprintf(stderr,
                     "Usage: %s [out_path] [--header|--no-header] [--ordered]"
-                    " [--dump-page <path.pbm>]\n",
+                    " [--mutate[=<kind>]] [--dump-page <path.pbm>]\n",
                     argv[0]);
             return 1;
         } else {
@@ -6018,8 +6224,21 @@ int main(int argc, char **argv)
 
     std::vector<std::vector<uint8_t> *> page_info =
         gensegment(SEG_PAGE_INFORMATION, (int32_t)page_number, page_info_number);
-    header_streams.insert(header_streams.begin() + page_info_pos, page_info[0]);
-    data_streams.insert(data_streams.begin() + page_info_pos, page_info[1]);
+    // 7.4.8: the page information segment must be the first segment associated
+    // with its page. Splicing it further in breaks exactly that, and nothing
+    // else -- its number still sorts first, so the violation is positional.
+    size_t splice_at = page_info_pos;
+    if (g_mutation == MUT_PAGE_INFO_LATE && !g_mutation_fired &&
+        header_streams.size() > page_info_pos + 1) {
+        splice_at = page_info_pos + 1 +
+                    (urand() % (header_streams.size() - page_info_pos - 1));
+        g_mutation_fired = true;
+        g_page_state_known = false;
+        printf("MUTATION page-info-late: spliced at %zu instead of %zu\n",
+               splice_at, page_info_pos);
+    }
+    header_streams.insert(header_streams.begin() + splice_at, page_info[0]);
+    data_streams.insert(data_streams.begin() + splice_at, page_info[1]);
 
     // 7.4.9: "If a page's height was originally unknown, then there must be
     // at least one end of stripe segment associated with the page. In this
@@ -6039,6 +6258,20 @@ int main(int argc, char **argv)
     std::vector<std::vector<uint8_t> *> end_of_page =
         gensegment(SEG_END_OF_PAGE, (int32_t)page_number);
     push_segment(end_of_page);
+
+    // 7.4.9: the end of page segment must be the last segment associated with
+    // its page. One more region after it breaks that, and is the shape that
+    // tests whether a decoder stops at end of page or keeps composing --
+    // PDFium returns kEndReached there, so the trailing region should never
+    // reach the page at all.
+    if (g_mutation == MUT_EOP_EARLY && !g_mutation_fired) {
+        std::vector<std::vector<uint8_t> *> stray =
+            gensegment(SEG_IMMEDIATE_GENERIC, (int32_t)page_number);
+        push_segment(stray);
+        g_mutation_fired = true;
+        g_page_state_known = false;
+        printf("MUTATION end-of-page-early: region emitted after end of page\n");
+    }
 
     // Page 1's model is the one --dump-page reports; take it before the next
     // page resets the geometry.
@@ -6081,7 +6314,11 @@ int main(int argc, char **argv)
     // `pix = ~pix`, PDF's ImageMask convention), and the bits past the page
     // width carry the default pixel value Fill() left there, inverted the
     // same way -- both are part of matching the file jbig2dec writes.
-    if (dump_page_path && g_dump_valid) {
+    // A mutated file is a negative test: even when the mutation lands on a
+    // later page and page 1's model is arguably still accurate, the oracle
+    // must not compare it. Suppressing on any fire keeps that a flat rule
+    // rather than a chain of reasoning about which rules can reach page 1.
+    if (dump_page_path && g_dump_valid && !g_mutation_fired) {
         FILE *pf = fopen(dump_page_path, "wb");
         if (pf) {
             fprintf(pf, "P4\n%u %u\n", g_dump_width, g_dump_height);
