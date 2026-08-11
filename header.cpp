@@ -5481,7 +5481,8 @@ std::vector<EmittedSegment> g_all_segments;
 // field -- leaving the data part exactly as its handler produced it, so the
 // file stays plausible right up to the rule it breaks.
 static bool apply_mutation(uint8_t &type, uint32_t &segment_number,
-                            std::vector<uint32_t> &refs, int32_t page)
+                            std::vector<uint32_t> &refs, int32_t page,
+                            bool unknown_len)
 {
     switch (g_mutation) {
     case MUT_SELF_REF:
@@ -5589,6 +5590,12 @@ static bool apply_mutation(uint8_t &type, uint32_t &segment_number,
     }
 
     case MUT_RESERVED_TYPE:
+        // 7.2.7 lets only an immediate generic region declare an unknown data
+        // length, so retyping one that did would break a second rule on top
+        // of this one -- and gensegmentheader() rightly refuses to write it.
+        // Decline instead: each file is meant to carry exactly one violation.
+        if (unknown_len)
+            return false;
         // 7.3: "All other segment types are reserved and must not be used."
         // The data part stays whatever its real handler produced, so this is a
         // reserved type carrying an entirely plausible payload. PDFium accepts
@@ -5799,7 +5806,7 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
     // The page model cannot predict a mutated decode, so it retires here
     // rather than reporting a page the oracle would then mis-flag.
     if (g_mutation != MUT_NONE && !g_mutation_fired && type != SEG_PAGE_INFORMATION) {
-        if (apply_mutation(type, segment_number, refs, forced_page)) {
+        if (apply_mutation(type, segment_number, refs, forced_page, unknown_len)) {
             g_mutation_fired = true;
             g_page_state_known = false;
             printf("MUTATION %s applied to segment %u (type %u, %zu refs)\n",
