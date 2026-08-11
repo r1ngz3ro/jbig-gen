@@ -5335,6 +5335,81 @@ int main(int argc, char **argv)
     // stay common (they exercise the empty-pool and no-reference paths)
     // while larger ones make the pools deep enough for those strategies
     // to describe genuinely different shapes.
+    // TODO(ordering): segment types are drawn uniformly here, so a segment
+    // that needs a provider usually appears before one exists and degrades
+    // to the random-payload fallback. Measured over ~2800 segments: text
+    // regions fall back 76.7% of the time (want a symbol dictionary with
+    // real symbols), halftone regions 59.5% (a real pattern dictionary),
+    // symbol dictionaries 41.3% (SDREFAGG=1 wants a real dictionary to
+    // import from), refinement regions 32.1% (an intermediate region whose
+    // bitmap is known); only generic regions, which refer to nothing, are
+    // near-always real at 3.1%. A fallback is not merely a weaker segment:
+    // it is undecodable payload, and pdfium stops at the first segment that
+    // fails, so one early fallback wastes every segment after it in a file
+    // that may hold 32. That is the main reason most real-content paths
+    // built here are rarely reached in a broad corpus.
+    //
+    // What the spec actually constrains is a partial order, never a total
+    // one over types. 7.2.5: a segment "must refer to only segments with
+    // lower segment numbers". 7.1 with D.1/D.2: file order is increasing
+    // segment number (D.3's embedded organization fixes no order at all).
+    // Positional rules are few and local -- profiles first (7.4.12), page
+    // information first for its page (7.4.8), end of page last (7.4.9), end
+    // of file last (7.4.11). 7.3.1 restricts *what* may be referred to, by
+    // type and cardinality, not sequence: nothing says dictionaries precede
+    // the regions using them, only that a given region's dictionaries carry
+    // lower numbers. So the shape to generate is a DAG, and any topological
+    // order of it is legal.
+    //
+    // Sketch for an opt-in ordered mode (behind an argv flag, default
+    // behaviour unchanged -- the unordered draw produces genuinely valid
+    // shapes worth keeping, since 7.3.1 permits an immediate refinement
+    // region referring to zero segments, and a text region with no
+    // dictionary is a real input a decoder must reject cleanly):
+    //
+    //   1. Expand a grammar into a dependency DAG, not into a sequence:
+    //        Content     -> TextUnit | HalftoneUnit | RefineUnit | Generic
+    //        TextUnit    -> SymbolDictChain TextRegion
+    //        SymbolDictChain -> SymbolDict | SymbolDict SymbolDictChain
+    //        HalftoneUnit-> PatternDict HalftoneRegion
+    //        RefineUnit  -> IntermediateRegion RefinementRegion
+    //      A grammar suits this better than a chain of "possible successors"
+    //      would: the constraint is that a provider exists *somewhere*
+    //      earlier, not that it sits immediately before, so a first-order
+    //      successor model cannot express it without smuggling the whole set
+    //      of available providers into its state. Recursion also reaches
+    //      shapes the uniform draw only stumbles into, like
+    //      SymbolDict -> SymbolDict -> TextRegion. And a production that
+    //      *consumes* its intermediate region enforces 7.3.1's "an
+    //      intermediate region segment may only be referred to by one other
+    //      non-extension segment" by construction -- currently violated in
+    //      27% of files that contain an intermediate region, because
+    //      gen_segment_refinement_region() never marks one as claimed.
+    //   2. Linearize the DAG topologically, with the linearizer randomized
+    //      separately. Keeping "what depends on what" apart from "what order
+    //      it is written in" leaves the layout free to vary (grouped,
+    //      interleaved, providers just-in-time), which the spec permits and
+    //      which fusing the two passes would pin to one shape.
+    //   3. That separation is also what makes *targeted* invalid files
+    //      cheap, as one-line mutations of a known-good structure rather
+    //      than undifferentiated noise: perturb the order for a forward
+    //      reference (breaks 7.2.5), duplicate an edge (breaks 7.3.1), drop
+    //      a provider for a dangling reference, move page info or end of
+    //      page (breaks 7.4.8/7.4.9). Each has a known correct rejection.
+    //   4. Keep an explicit Unsatisfied production so ordered mode still
+    //      emits some provider-less segments on purpose.
+    //
+    // Two caveats worth respecting. Simple weighting -- bias the type draw
+    // by which providers already exist -- would capture most of the
+    // content-depth win for a fraction of the code; the grammar earns its
+    // complexity on structural validity, multi-level chains and the
+    // negative-test capability, not on depth alone. And a plan cannot be
+    // binding: whether a symbol dictionary exports any symbols is decided
+    // inside its handler, so a planned TextUnit can still find nothing to
+    // place. The plan should carry intent while handlers stay free to
+    // degrade, or the file quietly stops matching its own plan -- the same
+    // model-diverges-from-reality failure the page comparison keeps
+    // catching elsewhere.
     size_t ncontent = (urand() & 1) ? urand() % 4 : 4 + urand() % 29;   // 0..3 or 4..32
     for (size_t i = 0; i < ncontent; i++) {
         std::vector<std::vector<uint8_t> *> seg = gensegment(-1, 1);
