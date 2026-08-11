@@ -1807,6 +1807,45 @@ size_t g_segment_len = 0;
 std::vector<GeneratedSegment> g_prior_segments;
 uint32_t g_next_segment_number = 0;
 
+// The segment type gensegment() is currently building. A handler serves
+// several types at once (one refinement-region handler covers 40, 42 and
+// 43), and 7.3.1 draws a real distinction between them -- type 40 must
+// refer to exactly one intermediate region, while 42 and 43 may refer to
+// none -- so a handler that has to honour that needs to know which it is.
+uint8_t g_current_segment_type = 0;
+
+// True when every reference 7.3.1 makes *mandatory* for `type` can be
+// satisfied from what already exists. See gensegment()'s type draw.
+static bool intermediate_region_claimed(uint32_t number);
+static bool type_mandatory_refs_available(uint8_t type)
+{
+    switch (type) {
+    case SEG_INTERMEDIATE_HALFTONE:
+    case SEG_IMMEDIATE_HALFTONE:
+    case SEG_IMMEDIATE_LOSSLESS_HALFTONE:
+        // "must refer to exactly one segment ... of type pattern dictionary"
+        for (const auto &seg : g_prior_segments)
+            if (seg.type == SEG_PATTERN_DICTIONARY)
+                return true;
+        return false;
+    case SEG_INTERMEDIATE_GENERIC_REFINEMENT:
+        // "must refer to exactly one other segment ... an intermediate
+        // region segment" -- and one already spoken for cannot be reused,
+        // per the single-referrer rule.
+        for (const auto &seg : g_prior_segments) {
+            bool is_intermediate = seg.type == SEG_INTERMEDIATE_TEXT ||
+                                   seg.type == SEG_INTERMEDIATE_HALFTONE ||
+                                   seg.type == SEG_INTERMEDIATE_GENERIC ||
+                                   seg.type == SEG_INTERMEDIATE_GENERIC_REFINEMENT;
+            if (is_intermediate && !intermediate_region_claimed(seg.number))
+                return true;
+        }
+        return false;
+    default:
+        return true;
+    }
+}
+
 // Returns the segment numbers of all prior segments of a given type, in
 // generation order.
 static std::vector<uint32_t> segment_numbers_of_type(const std::vector<GeneratedSegment> &prior,
@@ -4589,7 +4628,14 @@ SegResult gen_segment_refinement_region(const std::vector<GeneratedSegment> &pri
             }
         }
     } else {
-        refs = pick_refs(region_pool, 0, 1);
+        // 7.3.1 splits the three refinement types here: an *intermediate*
+        // one (type 40) "must refer to exactly one other segment", while an
+        // immediate one (42/43) "may refer to either zero other segments or
+        // exactly one". gensegment()'s draw guarantees a candidate exists
+        // before it offers type 40, so requiring one here cannot come up
+        // empty.
+        bool must_refer = g_current_segment_type == SEG_INTERMEDIATE_GENERIC_REFINEMENT;
+        refs = pick_refs(region_pool, must_refer ? 1 : 0, 1);
     }
     // Whichever pool it came from, this segment is now that region's one
     // permitted non-extension referrer (7.3.1).
@@ -5041,9 +5087,30 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
         SEG_END_OF_STRIPE,
         SEG_TABLES, SEG_COLOUR_PALETTE, SEG_EXTENSION
     };
-    uint8_t type = (forced_type >= 0)
-                       ? (uint8_t)forced_type
-                       : types[urand() % (sizeof(types) / sizeof(types[0]))];
+    // 7.3.1 makes two references *mandatory*, and neither referent can be
+    // conjured after the fact: a halftone region "must refer to exactly one
+    // segment, and this segment must be of type pattern dictionary", and an
+    // intermediate generic refinement region (type 40) "must refer to
+    // exactly one other segment ... an intermediate region segment". Drawing
+    // such a type before its referent exists produced a segment with no
+    // reference at all, which is ill-formed however the handler then fills
+    // the data part -- so those types are simply not offered until they can
+    // be satisfied. This is deliberately only about *mandatory* references;
+    // biasing the draw for optional ones is the larger job described in the
+    // TODO(ordering) note in main().
+    uint8_t type;
+    if (forced_type >= 0) {
+        type = (uint8_t)forced_type;
+    } else {
+        uint8_t candidates[sizeof(types) / sizeof(types[0])];
+        size_t ncand = 0;
+        for (uint8_t t : types)
+            if (type_mandatory_refs_available(t))
+                candidates[ncand++] = t;
+        // Never empty: a generic region refers to nothing and always fits.
+        type = candidates[urand() % ncand];
+    }
+    g_current_segment_type = type;
 
     uint32_t segment_number = (forced_number >= 0) ? (uint32_t)forced_number : g_next_segment_number++;
 
