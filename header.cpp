@@ -3016,6 +3016,24 @@ SegResult gen_symbol_dict_real_arith(const std::vector<GeneratedSegment> &prior)
     if (ctx_donor) {
         ctx_refs.push_back(ctx_donor->number);
         numinsyms = ctx_donor->num_symbols;
+    } else if (urand() % 3 == 0) {
+        // 7.3.1: a symbol dictionary "may refer to any number of segments of
+        // type symbol dictionary". Importing from several is the other way
+        // past 7.2.4's four-reference short form, and it costs nothing here
+        // beyond widening the export runs -- with SDREFAGG=0 no imported
+        // symbol is ever named by index, they only occupy the leading
+        // SDNUMINSYMS entries of SBSYMS that the runs below skip over.
+        std::vector<uint32_t> import_pool;
+        for (const auto &seg : prior)
+            if (seg.type == SEG_SYMBOL_DICTIONARY && seg.num_symbols > 0)
+                import_pool.push_back(seg.number);
+        ctx_refs = pick_refs(import_pool, 0, 40);
+        for (uint32_t r : ctx_refs)
+            for (const auto &seg : prior)
+                if (seg.number == r) {
+                    numinsyms += seg.num_symbols;
+                    break;
+                }
     }
 
     // Build 1-2 height classes of 1-3 small synthetic glyphs each, same as
@@ -3816,7 +3834,15 @@ SegResult gen_text_region_real(const std::vector<GeneratedSegment> &prior, bool 
     for (const auto &seg : prior)
         if (seg.type == SEG_SYMBOL_DICTIONARY && seg.num_symbols > 0)
             dict_pool.push_back(seg.number);
-    std::vector<uint32_t> refs = pick_refs(dict_pool, 1, 3);
+    // 7.3.1: a text region "may refer to any number of segments of type
+    // symbol dictionary". Going past four is what reaches 7.2.4's long-form
+    // referred-to count field -- a 4-byte count plus a run of retain bits --
+    // instead of the one-byte short form. PDFium parses that in a separate
+    // branch (jbig2_context.cpp:230) and caps the result at
+    // kJBig2MaxReferredSegmentCount, which is 64, so a deep draw is still an
+    // accepted file rather than a rejected one.
+    size_t dict_cap = (urand() % 4 == 0) ? 40 : 3;
+    std::vector<uint32_t> refs = pick_refs(dict_pool, 1, dict_cap);
 
     uint32_t sbnumsyms = 0;
     std::vector<ExportedSymbol> all_symbols;   // SBSYMS order: refs order, then within-dict order
@@ -4149,7 +4175,15 @@ SegResult gen_text_region_real_arith(const std::vector<GeneratedSegment> &prior,
     for (const auto &seg : prior)
         if (seg.type == SEG_SYMBOL_DICTIONARY && seg.num_symbols > 0)
             dict_pool.push_back(seg.number);
-    std::vector<uint32_t> refs = pick_refs(dict_pool, 1, 3);
+    // 7.3.1: a text region "may refer to any number of segments of type
+    // symbol dictionary". Going past four is what reaches 7.2.4's long-form
+    // referred-to count field -- a 4-byte count plus a run of retain bits --
+    // instead of the one-byte short form. PDFium parses that in a separate
+    // branch (jbig2_context.cpp:230) and caps the result at
+    // kJBig2MaxReferredSegmentCount, which is 64, so a deep draw is still an
+    // accepted file rather than a rejected one.
+    size_t dict_cap = (urand() % 4 == 0) ? 40 : 3;
+    std::vector<uint32_t> refs = pick_refs(dict_pool, 1, dict_cap);
 
     uint32_t sbnumsyms = 0;
     std::vector<ExportedSymbol> all_symbols;
@@ -4381,7 +4415,15 @@ SegResult gen_segment_text_region(const std::vector<GeneratedSegment> &prior)
     // 7.4.3.2: a text region draws its symbol instances from the symbol
     // dictionaries it refers to; a real one needs at least one.
     std::vector<uint32_t> dict_pool = segment_numbers_of_type(prior, SEG_SYMBOL_DICTIONARY);
-    std::vector<uint32_t> refs = pick_refs(dict_pool, 1, 3);   // a text region needs symbols
+    // 7.3.1: a text region "may refer to any number of segments of type
+    // symbol dictionary". Going past four is what reaches 7.2.4's long-form
+    // referred-to count field -- a 4-byte count plus a run of retain bits --
+    // instead of the one-byte short form. PDFium parses that in a separate
+    // branch (jbig2_context.cpp:230) and caps the result at
+    // kJBig2MaxReferredSegmentCount, which is 64, so a deep draw is still an
+    // accepted file rather than a rejected one.
+    size_t dict_cap = (urand() % 4 == 0) ? 40 : 3;
+    std::vector<uint32_t> refs = pick_refs(dict_pool, 1, dict_cap);   // a text region needs symbols
 
     uint8_t sbrtemplate = sbrefine ? (uint8_t)(urand() % 2) : 0;
 
@@ -5393,6 +5435,7 @@ enum MutationKind {
     MUT_CROSS_PAGE_REF,  // 7.2.6  referent belongs to another page
     MUT_DUP_SEG_NUMBER,  // reuse an earlier segment number (aliasing)
     MUT_RESERVED_TYPE,   // 7.3    a segment type the spec reserves
+    MUT_MULTIREF_REFINE, // 7.3.1  a refinement with its referent not first
     MUT_PAGE_INFO_LATE,  // 7.4.8  page information is not the page's first
     MUT_EOP_EARLY,       // 7.4.9  a region segment follows the end of page
     MUT_KIND_COUNT
@@ -5409,6 +5452,7 @@ static const char *mutation_name(MutationKind k)
     case MUT_CROSS_PAGE_REF: return "cross-page-ref";
     case MUT_DUP_SEG_NUMBER: return "dup-segment-number";
     case MUT_RESERVED_TYPE:  return "reserved-type";
+    case MUT_MULTIREF_REFINE: return "multiref-refine";
     case MUT_PAGE_INFO_LATE: return "page-info-late";
     case MUT_EOP_EARLY:      return "end-of-page-early";
     default:                 return "none";
@@ -5513,6 +5557,34 @@ static bool apply_mutation(uint8_t &type, uint32_t &segment_number,
         if (dup >= segment_number)
             return false;
         segment_number = dup;
+        return true;
+    }
+
+    case MUT_MULTIREF_REFINE: {
+        // 7.3.1 caps a refinement region at one referred-to segment, so this
+        // is a violation rather than a legal shape -- but it is the one that
+        // reaches PDFium's referent scan at jbig2_context.cpp:1136, which
+        // indexes referred_to_segment_numbers_[0] on every iteration of a
+        // loop over i. It therefore only ever examines the first reference.
+        // Putting a wrong-type segment first and the real intermediate region
+        // second should be rejected by PDFium and accepted by jbig2dec, whose
+        // jbig2_region_find_referred() scans the list properly.
+        if (type != SEG_INTERMEDIATE_GENERIC_REFINEMENT &&
+            type != SEG_IMMEDIATE_GENERIC_REFINEMENT &&
+            type != SEG_IMMEDIATE_LOSSLESS_GENERIC_REFINEMENT)
+            return false;
+        if (refs.size() != 1)
+            return false;
+        std::vector<uint32_t> decoys;
+        for (const auto &sg : g_prior_segments)
+            if (sg.number < segment_number && sg.number != refs[0] &&
+                sg.type != SEG_INTERMEDIATE_TEXT && sg.type != SEG_INTERMEDIATE_HALFTONE &&
+                sg.type != SEG_INTERMEDIATE_GENERIC &&
+                sg.type != SEG_INTERMEDIATE_GENERIC_REFINEMENT)
+                decoys.push_back(sg.number);
+        if (decoys.empty())
+            return false;
+        refs.insert(refs.begin(), decoys[urand() % decoys.size()]);
         return true;
     }
 
