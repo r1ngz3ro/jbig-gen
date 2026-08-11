@@ -152,6 +152,39 @@ refinement TPGRON contexts are `0x0010` (GRTEMPLATE 0) and `0x0008`
 Consequence for the record: EXTTEMPLATE+TPGDON is unverifiable because PDFium
 has no EXTTEMPLATE support at all, **not** because of SLTP constants.
 
+### Striped page growth is an embedder decision, not a file property
+
+A page may declare its bitmap height unknown (`0xFFFFFFFF`, 7.4.8.2), which
+forces the "page is striped" bit and makes the maximum stripe size the height
+a decoder starts from (7.4.8.6). Whether the page then *grows* is up to the
+embedder:
+
+- **PDFium** expands a striped page only when it allocated the page itself.
+  Every expansion site sits behind `if (!buf_specified_)`, and
+  `buf_specified_` is set by `GetFirstPage()` -- the only way its public API
+  decodes a page. A caller that hands in a buffer, as PDF rendering and our
+  harness both do, gets a fixed page of max-stripe-size rows with everything
+  below it clipped. PDFium also ignores end of stripe segments outright
+  (`jbig2_context.cpp:391` skips their data).
+- **Ghostscript jbig2dec** allocates its own page and really does resize
+  (`jbig2_page.c:294`).
+
+So the two disagree on the final height of these files. That is an
+embedder-API artifact rather than a decoder bug, and it means PDFium's
+`Expand()` path is effectively unreachable through its own public API. The
+generator's page model mirrors the buffer-supplied behaviour, since that is
+what the oracle compares against.
+
+### Custom Huffman tables jbig2dec rejects
+
+Some of our Tables segments (type 53) draw a `FATAL ERROR encountered
+unpopulated huffman table entry` or `ran off the end of the entries table`
+from jbig2dec while PDFium accepts them: 6 of 44 files carrying a tables
+segment, measured on `b39b326`, i.e. predating the symbol-dictionary work.
+Not yet diagnosed -- it is either a latent defect in how B.2 tables are
+emitted or another jbig2dec limitation, and it needs the same
+bisect-and-bucket treatment the text region defect got.
+
 ## What blocks jbig2dec as an oracle (not our bugs)
 
 Roughly 53% of generated files never reach segment parsing under jbig2dec:
