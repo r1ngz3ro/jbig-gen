@@ -1743,6 +1743,27 @@ std::vector<uint8_t> g_page_bitmap;
 // this only stops a later segment from *claiming* to know it.
 bool g_page_state_known = true;
 
+// 7.3.1: "An intermediate region segment may only be referred to by one
+// other non-extension segment; it may be referred to by any number of
+// extension segments." The rule is not bookkeeping: an intermediate
+// region's auxiliary buffer is *consumed* by the refinement that refers to
+// it -- 8.2 step 5d requires "a previously occurring intermediate region
+// segment that has not yet had a refinement region segment refer to it" --
+// so a second non-extension referrer would be reading a buffer the decoder
+// model has already spent. Segment numbers land here once claimed, so the
+// candidate pools never offer the same one twice. Extension segments are
+// deliberately not tracked: 7.3.1 lets any number of them refer to the
+// same region.
+std::vector<uint32_t> g_claimed_intermediate_regions;
+
+static bool intermediate_region_claimed(uint32_t number)
+{
+    for (uint32_t n : g_claimed_intermediate_regions)
+        if (n == number)
+            return true;
+    return false;
+}
+
 // 7.4.8.1/.2 + case 48's page_->Fill(default pixel): the state a decoder's
 // page buffer is in before any region segment composes onto it.
 static void page_state_init(uint32_t width, uint32_t height, bool default_pixel)
@@ -4529,8 +4550,13 @@ SegResult gen_segment_refinement_region(const std::vector<GeneratedSegment> &pri
     // referred-to segment whose type isn't 4/20/36/40 with a hard parse
     // failure before it even looks at content) -- and, among those, to the
     // types this generator codes real content for.
+    // A region already claimed by an earlier refinement segment is skipped
+    // outright: 7.3.1 allows an intermediate region only one non-extension
+    // referrer (see g_claimed_intermediate_regions).
     std::vector<uint32_t> refbitmap_pool;
     for (const auto &seg : prior) {
+        if (intermediate_region_claimed(seg.number))
+            continue;
         switch (seg.type) {
         case SEG_INTERMEDIATE_GENERIC: case SEG_INTERMEDIATE_GENERIC_REFINEMENT:
         case SEG_INTERMEDIATE_TEXT:
@@ -4565,6 +4591,10 @@ SegResult gen_segment_refinement_region(const std::vector<GeneratedSegment> &pri
     } else {
         refs = pick_refs(region_pool, 0, 1);
     }
+    // Whichever pool it came from, this segment is now that region's one
+    // permitted non-extension referrer (7.3.1).
+    if (!refs.empty())
+        g_claimed_intermediate_regions.push_back(refs[0]);
 
     // 7.4.7.2: generic refinement region segment flags. Decide up front:
     // real content needs the declared region size to agree with what is
@@ -5396,6 +5426,21 @@ int main(int argc, char **argv)
     //      reference (breaks 7.2.5), duplicate an edge (breaks 7.3.1), drop
     //      a provider for a dangling reference, move page info or end of
     //      page (breaks 7.4.8/7.4.9). Each has a known correct rejection.
+    //      These are not equally worth generating, though, and the
+    //      difference is how *deep* the file gets before it is refused.
+    //      Anything that violates 7.2.5 -- a forward reference, a
+    //      self-reference, a cycle -- dies on one integer comparison in
+    //      ParseSegmentHeader ("referred-to >= own number"), before a byte
+    //      of segment data is read; a cycle cannot even reach its second
+    //      edge, since the first forward one already failed. Confirmed by
+    //      hand-forging those three shapes: all refused, valgrind-clean,
+    //      while an otherwise identical *backward* reference decodes. They
+    //      make fine conformance assertions -- cheap, known answer -- but
+    //      poor fuzzing, because almost no decoder surface runs. The
+    //      mutations worth the effort are the ones that survive header
+    //      parsing and fail somewhere inside the decode: a reference to a
+    //      plausible-but-absent segment, or to a segment of the wrong type
+    //      for the referrer.
     //   4. Keep an explicit Unsatisfied production so ordered mode still
     //      emits some provider-less segments on purpose.
     //
