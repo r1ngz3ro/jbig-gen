@@ -1688,6 +1688,16 @@ struct GeneratedSegment {
     // time, against 0/43 when the width was byte-aligned, 0/264 with
     // SBDEFPIXEL=0, and 0/2257 for an intermediate generic reference.
     bool ref_padding_dirty;
+    // 7.4.2.1.1 bit 9 "bitmap coding context retained": the generic-region
+    // arithmetic statistics as they stood at the end of decoding this symbol
+    // dictionary, which a later dictionary may adopt by setting bit 8
+    // ("bitmap coding context used"). Empty unless this is a symbol
+    // dictionary that set the retain bit. Step 3 of 7.4.2.1.1 also requires
+    // the borrower to match SDHUFF, SDREFAGG, SDTEMPLATE, SDRTEMPLATE and
+    // every AT location, so the ones that vary here are recorded alongside.
+    std::vector<uint8_t> sd_gbcx;
+    uint8_t sd_template;
+    std::vector<int8_t> sd_at;
     // The bitmap this segment decodes to, when the generator coded real
     // content and so knows it exactly (empty when the data part was random
     // payload). One byte per pixel, row-major, bw x bh. Only an
@@ -2137,6 +2147,11 @@ struct SegResult {
     // pixels past the declared width that this generator cannot reproduce,
     // making it unsafe as a GRREFERENCE. See GeneratedSegment's copy.
     bool ref_padding_dirty = false;
+    // Filled in by a symbol dictionary that set the "bitmap coding context
+    // retained" bit; see GeneratedSegment's copy.
+    std::vector<uint8_t> sd_gbcx = {};
+    uint8_t sd_template = 0;
+    std::vector<int8_t> sd_at = {};
     // Generic regions only, for the unknown-length trailer gensegment()
     // appends (7.2.7). Reported by the handler rather than recovered by
     // re-parsing the bytes it just wrote, so the trailer cannot drift out
@@ -2194,7 +2209,7 @@ RegionInfo gen_segment_region_info(bool force_replace = false, uint32_t max_dim 
                                      uint32_t force_w = 0, uint32_t force_h = 0,
                                      int64_t force_x = INT64_MIN, int64_t force_y = INT64_MIN);
 SegResult gen_segment_symbol_dict(const std::vector<GeneratedSegment> &prior);
-SegResult gen_symbol_dict_real(void);
+SegResult gen_symbol_dict_real(const std::vector<GeneratedSegment> &prior);
 SegResult gen_segment_text_region(const std::vector<GeneratedSegment> &prior);
 SegResult gen_text_region_real(const std::vector<GeneratedSegment> &prior, bool sbrefine);
 SegResult gen_text_region_real_arith(const std::vector<GeneratedSegment> &prior, bool sbrefine);
@@ -2713,22 +2728,54 @@ static void pack_collective_bitmap(std::vector<uint8_t> &d, int height, int totw
 // always valid regardless of which standard table gets picked.
 // Height-class collective bitmaps are stored uncompressed (BMSIZE=0,
 // 6.5.9 step 3) rather than MMR-coded.
-SegResult gen_symbol_dict_real(void)
+SegResult gen_symbol_dict_real(const std::vector<GeneratedSegment> &prior)
 {
     std::vector<uint8_t> d;
 
     bool dh_table_b5 = (urand() & 1) != 0;   // false=B.4, true=B.5
     bool dw_table_b3 = (urand() & 1) != 0;   // false=B.2, true=B.3
 
+    // 7.4.2.1.6: selector 3 (DH/DW) and 1 (BMSIZE) mean "user-supplied
+    // table", each matched by its own distinct referred-to tables segment,
+    // taken in the order SDHUFFDH, SDHUFFDW, SDHUFFBMSIZE, SDHUFFAGGINST.
+    // A tables segment here can only encode the single value its harvested
+    // line covers with zero offset bits (see GeneratedSegment::table_rows),
+    // so one is only usable where every value coded through it is that same
+    // value: a constant height or width delta for DH/DW, and 0 for BMSIZE,
+    // which is what an uncompressed collective bitmap always codes.
+    //
+    // SDHUFFDW is deliberately left out: 6.5.5 step 4c(i) ends every height
+    // class with an OOB coded through SBHUFFDW, and a harvested single line
+    // carries no OOB entry, so a decoder handed one could never terminate a
+    // class. DH and BMSIZE never code OOB, so both are safe.
+    const GeneratedSegment *dh_tab = nullptr, *bm_tab = nullptr;
+    for (const auto &seg : prior) {
+        if (seg.type != SEG_TABLES || seg.table_rows.empty())
+            continue;
+        int32_t v = seg.table_rows[0].val;
+        if (v >= 1 && v <= 16 && !dh_tab && (urand() & 1))
+            dh_tab = &seg;
+        else if (v == 0 && !bm_tab && (urand() & 1))
+            bm_tab = &seg;
+    }
+    // With a custom DH table the height deltas are no longer free: every
+    // class steps by exactly that table's one codable value.
+    int dh_step = dh_tab ? dh_tab->table_rows[0].val : 0;
+
     // 7.4.2.1.1: symbol dictionary flags. SDHUFF=1 (bit 0), SDREFAGG=0
-    // (bit 1); SDHUFFDH/SDHUFFDW select between the two standard tables
-    // for each (bits 2-3, 4-5); SDHUFFBMSIZE stays 0 = Table B.1 (bit 6);
+    // (bit 1); SDHUFFDH/SDHUFFDW (bits 2-3, 4-5); SDHUFFBMSIZE (bit 6);
     // SDHUFFAGGINST/context bits/SDTEMPLATE/SDRTEMPLATE are all "must be
     // 0" here since SDREFAGG=0 and SDHUFF=1.
     uint16_t flags = 0x0001;
-    flags |= (uint16_t)((dh_table_b5 ? 1 : 0) << 2);
+    flags |= (uint16_t)((dh_tab ? 3 : (dh_table_b5 ? 1 : 0)) << 2);
     flags |= (uint16_t)((dw_table_b3 ? 1 : 0) << 4);
+    if (bm_tab)
+        flags |= 0x0040;
     put_be16(d, flags);
+
+    std::vector<uint32_t> refs;
+    if (dh_tab) refs.push_back(dh_tab->number);
+    if (bm_tab) refs.push_back(bm_tab->number);
 
     // Build 1-2 height classes of 1-3 small synthetic glyphs each, heights
     // and (within a class) widths strictly increasing.
@@ -2738,7 +2785,7 @@ SegResult gen_symbol_dict_real(void)
     uint32_t total_syms = 0;
     int prev_height = 0;
     for (int c = 0; c < nclasses; c++) {
-        int height = prev_height + 1 + (int)(urand() % 8);
+        int height = prev_height + (dh_tab ? dh_step : 1 + (int)(urand() % 8));
         prev_height = height;
         class_height.push_back(height);
         int nsyms = 1 + (int)(urand() % 3);
@@ -2762,8 +2809,11 @@ SegResult gen_symbol_dict_real(void)
     // bytes alternate, so the bit writer is flushed to `d` and restarted
     // around every collective bitmap.
     BitWriter bw;
-    StdHuffTable dh_table = dh_table_b5 ? STD_TABLE(HUFF_B5) : STD_TABLE(HUFF_B4);
+    StdHuffTable dh_table = dh_tab ? StdHuffTable{ dh_tab->table_rows.data(), 1 }
+                           : dh_table_b5 ? STD_TABLE(HUFF_B5) : STD_TABLE(HUFF_B4);
     StdHuffTable dw_table = dw_table_b3 ? STD_TABLE(HUFF_B3) : STD_TABLE(HUFF_B2);
+    StdHuffTable bm_table = bm_tab ? StdHuffTable{ bm_tab->table_rows.data(), 1 }
+                                   : STD_TABLE(HUFF_B1);
     prev_height = 0;
     for (int c = 0; c < nclasses; c++) {
         int hcdh = class_height[c] - prev_height;
@@ -2779,7 +2829,7 @@ SegResult gen_symbol_dict_real(void)
         }
         huff_encode(bw, dw_table, OOB_VAL);   // end of height class
 
-        huff_encode(bw, STD_TABLE(HUFF_B1), 0);   // BMSIZE = 0: collective bitmap is uncompressed
+        huff_encode(bw, bm_table, 0);   // BMSIZE = 0: collective bitmap is uncompressed
         bw_finish(bw);
         append(d, bw.bytes.data(), bw.bytes.size());
         bw = BitWriter();
@@ -2798,6 +2848,7 @@ SegResult gen_symbol_dict_real(void)
            d.size(), total_syms, nclasses);
     SegResult r;
     r.data = d;
+    r.refs = refs;
     r.num_symbols = total_syms;
     // 7.4.3.1.6: a decoder assigns SBSYMS in referred-to-dictionary order,
     // then within a dictionary in the order its own new symbols were
@@ -2837,23 +2888,71 @@ SegResult gen_symbol_dict_real(void)
 // no other real content in this generator reaches -- see the
 // TODO(coverage) comment on gen_segment_symbol_dict()'s structural
 // fallback, which this closes.
-SegResult gen_symbol_dict_real_arith(void)
+SegResult gen_symbol_dict_real_arith(const std::vector<GeneratedSegment> &prior)
 {
     std::vector<uint8_t> d;
 
     uint8_t sdtemplate = (uint8_t)(urand() % 4);
 
-    // 7.4.2.1.1: SDHUFF=0 (bit 0), SDREFAGG=0 (bit 1); SDTEMPLATE (bits
-    // 10-11); everything else (SDHUFFxx selectors, context-reuse bits,
-    // SDRTEMPLATE) is meaningless when SDHUFF=0/SDREFAGG=0, stays 0.
+    // 7.4.2.1.1 bit 8, "bitmap coding context used": adopt the generic-region
+    // arithmetic statistics left behind by the last referred-to symbol
+    // dictionary rather than starting from zero (step 3), which is what the
+    // NOTE there means by later dictionaries reusing what earlier ones
+    // "learned". The donor must have set the retain bit, and step 3 requires
+    // SDHUFF, SDREFAGG, SDTEMPLATE, SDRTEMPLATE and every AT location to
+    // match -- so the donor's SDTEMPLATE and AT list are adopted wholesale
+    // here instead of being drawn, and only dictionaries this function
+    // produced (SDHUFF=0, SDREFAGG=0) are eligible. pdfium enforces the size
+    // half of that itself: a mismatched context array is a hard parse
+    // failure (jbig2_context.cpp:549).
+    const GeneratedSegment *ctx_donor = nullptr;
+    if (urand() % 3 == 0) {
+        std::vector<const GeneratedSegment *> donors;
+        for (const auto &seg : prior)
+            if (seg.type == SEG_SYMBOL_DICTIONARY && !seg.sd_gbcx.empty() && seg.num_symbols > 0)
+                donors.push_back(&seg);
+        if (!donors.empty())
+            ctx_donor = donors[urand() % donors.size()];
+    }
+    if (ctx_donor)
+        sdtemplate = ctx_donor->sd_template;
+
+    // Retaining costs nothing to code -- the decoder simply keeps its own
+    // ending statistics (step 7) -- so it is offered freely, and is what
+    // makes this dictionary available as a donor later.
+    bool ctx_retained = (urand() & 1) != 0;
+
+    // 7.4.2.1.1: SDHUFF=0 (bit 0), SDREFAGG=0 (bit 1); context used (bit 8)
+    // and retained (bit 9); SDTEMPLATE (bits 10-11). The SDHUFFxx selectors
+    // and SDRTEMPLATE are meaningless when SDHUFF=0/SDREFAGG=0, so stay 0.
     uint16_t flags = (uint16_t)(sdtemplate << 10);
+    if (ctx_donor)
+        flags |= 0x0100;
+    if (ctx_retained)
+        flags |= 0x0200;
     put_be16(d, flags);
 
     // 7.4.2.1.2: symbol dictionary AT flags, present since SDHUFF == 0.
     int npairs = sdtemplate == 0 ? 4 : 1;
     AtPixel at[4] = {};
-    for (int i = 0; i < npairs; i++)
-        at[i] = write_primary_at_pixel(d);   // SDATXn/SDATYn
+    for (int i = 0; i < npairs; i++) {
+        if (ctx_donor)
+            at[i] = write_nominal_at_pixel(d, ctx_donor->sd_at[(size_t)i * 2],
+                                            ctx_donor->sd_at[(size_t)i * 2 + 1]);
+        else
+            at[i] = write_primary_at_pixel(d);   // SDATXn/SDATYn
+    }
+
+    // 7.4.2.2: referring to the donor is what makes it "the last referred-to
+    // symbol dictionary segment". Its exported symbols are imported here as a
+    // side effect (SDNUMINSYMS), which only changes the export runs below --
+    // with SDREFAGG=0 nothing else in this segment names a symbol by index.
+    std::vector<uint32_t> ctx_refs;
+    uint32_t numinsyms = 0;
+    if (ctx_donor) {
+        ctx_refs.push_back(ctx_donor->number);
+        numinsyms = ctx_donor->num_symbols;
+    }
 
     // Build 1-2 height classes of 1-3 small synthetic glyphs each, same as
     // gen_symbol_dict_real() -- heights and (within a class) widths need
@@ -2893,6 +2992,11 @@ SegResult gen_symbol_dict_real_arith(void)
     MQEncoder mq;
     ArithIntCtx iadh, iadw, iaex;
     std::vector<uint8_t> gbcx(1u << (sdtemplate == 0 ? 16 : sdtemplate == 1 ? 13 : 10), 0);
+    // Step 3/4: start from the donor's ending statistics when the "context
+    // used" bit is set, from zero otherwise. The donor's SDTEMPLATE was
+    // adopted above, so the two arrays are necessarily the same size.
+    if (ctx_donor)
+        gbcx = ctx_donor->sd_gbcx;
     int atx1 = at[0].x, aty1 = at[0].y;
 
     prev_height = 0;
@@ -2920,11 +3024,11 @@ SegResult gen_symbol_dict_real_arith(void)
         mq_encode_arith_int(mq, iadw, 0, /*oob=*/true);   // end of height class
     }
 
-    // 6.5.10: export every symbol via two runs (not-exported length 0,
-    // then exported length total_syms) -- same shape as
-    // gen_symbol_dict_real()'s Huffman version, via IAEX instead of Table
-    // B.1.
-    mq_encode_arith_int(mq, iaex, 0);
+    // 6.5.10: the export runs cover SDNUMINSYMS + SDNUMNEWSYMS entries, so
+    // skip over any imported symbols first and then export just the new
+    // ones. With no import this is the same "run of 0, then run of
+    // total_syms" gen_symbol_dict_real()'s Huffman version codes.
+    mq_encode_arith_int(mq, iaex, (int32_t)numinsyms);
     mq_encode_arith_int(mq, iaex, (int32_t)total_syms);
     mq_flush(mq);
     append(d, mq.out.data(), mq.out.size());
@@ -2940,7 +3044,22 @@ SegResult gen_symbol_dict_real_arith(void)
            d.size(), total_syms, nclasses);
     SegResult r;
     r.data = d;
+    r.refs = ctx_refs;
     r.num_symbols = total_syms;
+    // Step 7: with the retain bit set, the decoder keeps these statistics on
+    // the dictionary for a later one to adopt, so keep the encoder's matching
+    // copy -- `gbcx` has just been carried through every symbol's bitmap and
+    // now holds exactly what the decoder's own gbContexts span does. The
+    // template and AT list ride along because step 3 makes a borrower match
+    // them.
+    if (ctx_retained) {
+        r.sd_gbcx = gbcx;
+        r.sd_template = sdtemplate;
+        for (int i = 0; i < 4; i++) {
+            r.sd_at.push_back((int8_t)at[i].x);
+            r.sd_at.push_back((int8_t)at[i].y);
+        }
+    }
     for (const auto &syms : classes) {
         for (const Glyph &g : syms) {
             ExportedSymbol es;
@@ -3254,78 +3373,13 @@ SegResult gen_segment_symbol_dict(const std::vector<GeneratedSegment> &prior)
                       : gen_symbol_dict_real_refagg_arith(prior, chosen[0]);
     }
 
-    if (sdhuff && !sdrefagg)
-        return gen_symbol_dict_real();
-
-    if (!sdhuff && !sdrefagg)
-        return gen_symbol_dict_real_arith();
-
-    std::vector<uint8_t> d;
-
-    // Remaining structural fallback: SDREFAGG == 1 with no real dictionary
-    // in `prior` to import a seed symbol from -- see gen_symbol_dict_real_
-    // refagg()'s and gen_symbol_dict_real_refagg_arith()'s comments.
-    //
-    // 7.4.2.2: a symbol dictionary may import symbols from earlier symbol
-    // dictionary segments.
-    std::vector<uint32_t> dict_pool = segment_numbers_of_type(prior, SEG_SYMBOL_DICTIONARY);
-    std::vector<uint32_t> refs = pick_refs(dict_pool, 0, 2);   // importing is optional
-
-    uint8_t sdtemplate = sdhuff ? 0 : (uint8_t)(urand() % 4);
-    uint8_t sdrtemplate = sdrefagg ? (uint8_t)(urand() % 2) : 0;
-
-    // 7.4.2.1.6: a "user-supplied" (3) Huffman table selector must be
-    // matched by a distinct referred-to tables segment, in the order
-    // SDHUFFDH, SDHUFFDW, SDHUFFBMSIZE, SDHUFFAGGINST.
-    std::vector<uint32_t> table_pool = segment_numbers_of_type(prior, SEG_TABLES);
-    std::vector<uint32_t> table_refs;
-
-    // 7.4.2.1.1: symbol dictionary flags (2 bytes).
-    uint16_t flags = 0;
-    if (sdhuff)
-        flags |= 0x0001;
-    if (sdrefagg)
-        flags |= 0x0002;
-    flags |= (uint16_t)((sdhuff ? pick_sel_013(table_pool, table_refs) : 0) << 2);   // SDHUFFDH
-    flags |= (uint16_t)((sdhuff ? pick_sel_013(table_pool, table_refs) : 0) << 4);   // SDHUFFDW
-    if (sdhuff && pick_sel_bit(table_pool, table_refs))
-        flags |= 0x0040;                                        // SDHUFFBMSIZE
-    if (sdhuff && sdrefagg && pick_sel_bit(table_pool, table_refs))
-        flags |= 0x0080;                                        // SDHUFFAGGINST
-    bool ctx_allowed = !(sdhuff && !sdrefagg);
-    if (ctx_allowed && (urand() & 1))
-        flags |= 0x0100;                                        // bitmap coding context used
-    if (ctx_allowed && (urand() & 1))
-        flags |= 0x0200;                                        // bitmap coding context retained
-    flags |= (uint16_t)(sdtemplate << 10);
-    flags |= (uint16_t)(sdrtemplate << 12);
-    put_be16(d, flags);
-
-    // 7.4.2.1.2: symbol dictionary AT flags, present only if SDHUFF == 0.
-    if (!sdhuff) {
-        int npairs = (sdtemplate == 0) ? 4 : 1;
-        for (int i = 0; i < npairs; i++)
-            write_primary_at_pixel(d);       // SDATXn/SDATYn
-    }
-
-    // 7.4.2.1.3: symbol dictionary refinement AT flags, present only if
-    // SDREFAGG == 1 and SDRTEMPLATE == 0.
-    if (sdrefagg && sdrtemplate == 0) {
-        write_primary_at_pixel(d);           // SDRATX1/SDRATY1
-        write_reference_at_pixel(d);         // SDRATX2/SDRATY2
-    }
-
-    put_be32(d, 1 + (urand() % 64));         // 7.4.2.1.4: SDNUMEXSYMS
-    put_be32(d, 1 + (urand() % 64));         // 7.4.2.1.5: SDNUMNEWSYMS
-
-    // Remainder: coded symbol bitmaps (and Huffman tables if SDHUFF), not modeled.
-    append_random_payload(d, 256);
-
-    for (uint32_t t : table_refs)
-        refs.push_back(t);
-
-    printf("symbol-dictionary handler (%zu bytes, %zu refs, structural)\n", d.size(), refs.size());
-    return { d, refs };
+    // Every SDHUFF x SDREFAGG combination is codable, so there is no
+    // structural fallback: the sdrefagg reset above guarantees a real
+    // dictionary exists to import from whenever SDREFAGG survives the draw.
+    // One used to sit here, unreachable behind these returns, and was the
+    // only place several 7.4.2.1.1 flag fields were ever written; they are
+    // emitted from the real handlers now, on content that actually decodes.
+    return sdhuff ? gen_symbol_dict_real(prior) : gen_symbol_dict_real_arith(prior);
 }
 
 // 7.4.3.1: text region segment data header (Figure 37). Starts with the
@@ -4105,9 +4159,7 @@ SegResult gen_text_region_real_arith(const std::vector<GeneratedSegment> &prior,
         refine_cx_state.assign(1u << (sbrtemplate == 0 ? 13 : 10), 0);
 
     // 6.4.5-8's placement math -- see gen_text_region_real()'s comment on
-    // the identical FIRSTS/CURS/GetComposeData logic this mirrors.
-    bool right_corner = (refcorner == 2 || refcorner == 3);
-    bool bottom_corner = (refcorner == 0 || refcorner == 2);
+    // the identical FIRSTS/CURS/text_placement() logic this mirrors.
     int32_t firsts = 0, curs = 0;
     std::vector<uint8_t> canvas((size_t)ri.width * ri.height, sbdefpixel ? 1 : 0);
 
@@ -5028,7 +5080,20 @@ SegResult gen_segment_tables(const std::vector<GeneratedSegment> &)
     flags |= (uint8_t)((htrs - 1) << 4);
     d.push_back(flags);
 
-    int32_t htlow = (int32_t)(urand() % 0x10000);   // B.2.2: HTLOW
+    // B.2.2: HTLOW. Mostly drawn anywhere in a 16-bit span, but a third of
+    // the time aimed so that the harvested line below (HTLOW + nlines - 1,
+    // the one later handlers encode against) lands on a small value. A
+    // symbol dictionary can only select this table for SDHUFFDH/SDHUFFDW if
+    // the one value it can code is a usable height or width delta, and for
+    // SDHUFFBMSIZE only if that value is 0 -- with HTLOW spread over 65536
+    // that essentially never happened, leaving those selectors unreachable.
+    // HTLOW is signed (B.2.2), so aiming low may put it below zero, which is
+    // as legal as any other value.
+    int32_t htlow;
+    if (urand() % 3 == 0)
+        htlow = (int32_t)(urand() % 9) - (int32_t)(nlines - 1);
+    else
+        htlow = (int32_t)(urand() % 0x10000);
 
     // The last line's RANGELEN must still fit in HTRS bits once written
     // (otherwise bw_put_bits() truncates it and the decoder would read
@@ -5269,6 +5334,9 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
     uint32_t num_symbols = 0;
     bool ext_template = false;
     bool ref_padding_dirty = false;
+    std::vector<uint8_t> sd_gbcx;
+    uint8_t sd_template = 0;
+    std::vector<int8_t> sd_at;
     bool mmr = false;
     uint32_t region_rows = 0;
     uint32_t bw = 0, bh = 0;
@@ -5287,6 +5355,9 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
         num_symbols = r.num_symbols;
         ext_template = r.ext_template;
         ref_padding_dirty = r.ref_padding_dirty;
+        sd_gbcx = std::move(r.sd_gbcx);
+        sd_template = r.sd_template;
+        sd_at = std::move(r.sd_at);
         mmr = r.mmr;
         region_rows = r.region_rows;
         bw = r.bw;
@@ -5412,7 +5483,8 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
     g_prior_segments.push_back({ segment_number, type,
                                   (uint32_t)(forced_page >= 0 ? forced_page : 0),
                                   colored, combop, (uint32_t)refs.size(), num_symbols, ext_template,
-                                  ref_padding_dirty, bw, bh, std::move(bitmap), std::move(symbols), std::move(table_rows), hdpw });
+                                  ref_padding_dirty, std::move(sd_gbcx), sd_template,
+                                  std::move(sd_at), bw, bh, std::move(bitmap), std::move(symbols), std::move(table_rows), hdpw });
 
     std::vector<std::vector<uint8_t> *> parts;
     parts.push_back(hdr);
