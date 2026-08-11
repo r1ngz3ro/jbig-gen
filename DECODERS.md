@@ -88,6 +88,55 @@ for refinement regions.** The exact internal path from "un-subsetted reference"
 to "only diverges when defpix=1" was not fully isolated — the trigger is
 confirmed empirically, the mechanism is inferred from their TODO.
 
+### jbig2dec misparses the long-form referred-to count (7.2.4)
+
+**A real bug in Ghostscript jbig2dec, found by generating a field that no
+conforming encoder normally emits.**
+
+7.2.4 puts the referred-to count field in long form when a segment refers to
+more than four others: a 4-byte word with bits 29-31 set to 7 and R in bits
+0-28, followed by **ceil((R+1)/8)** bytes of retain bits. The spec's own
+example is explicit -- "if this segment refers to between five and seven other
+segments, then the field is five bytes long", i.e. 4 + 1.
+
+jbig2dec computes the retain-byte count with integer division instead
+(`jbig2_segment.c:80`, and `:60` in the 0.11 copy, so it is long-standing):
+
+```c
+offset = 5 + 4 + (referred_to_segment_count + 1) / 8;   /* floor, not ceil */
+```
+
+PDFium gets it right -- `(number_of_bits_to_skip + 7) / 8` at
+`jbig2_context.cpp:241`.
+
+The two agree only when `(R+1) % 8 == 0`, i.e. R = 7, 15, 23. For every other
+R above 4, jbig2dec starts reading the referred-to numbers one byte early. It
+consumes the retain byte as the first reference and shifts the rest, then
+reads page association and data length from the wrong offsets too -- so the
+segment's declared length is wrong, the next segment is located wrongly, and
+the remainder of the file is misparsed.
+
+Byte-level proof from one generated file, segment 24 with R=5:
+
+```
+00 00 00 18 | 44 | e0 00 00 05 | 36 | 0b 0e 0f 13 16
+ segment num  fl   long-form R   retain  refs 11,14,15,19,22
+
+  read with ceil  (1 retain byte) -> 11 14 15 19 22   spec / PDFium
+  read with floor (0 retain bytes) -> 54 11 14 15 19   jbig2dec
+```
+
+`54` is the retain byte `0x36` misread as a segment number.
+
+This is not a memory-safety issue: the buffer bound at `jbig2_segment.c:90`
+is computed from the same wrong offset, so every read stays inside what was
+validated. It is a pure misparse -- but a total one for the affected segment
+and everything after it.
+
+It went unnoticed because nothing normally emits R > 4. Our generator did not
+either until the reference caps were raised; the long-form branch was
+reachable in PDFium and jbig2dec but never taken.
+
 ## Normative tables, cross-checked
 
 ### Annex E arithmetic coder state table (Table E.1)
