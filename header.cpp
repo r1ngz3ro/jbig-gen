@@ -3155,34 +3155,234 @@ SegResult gen_segment_symbol_dict(const std::vector<GeneratedSegment> &prior)
 
 // 7.4.3.1: text region segment data header (Figure 37). Starts with the
 // common region segment information field (7.4.1).
-// 7.4.3.1.7: symbol ID Huffman table. Rather than run-length-coding a
-// varied set of code lengths, every symbol gets the *same* code length L
-// (ceil(log2(SBNUMSYMS)), min 1): with no shorter length in use, B.3's
-// canonical assignment gives symbol i the plain L-bit binary code i, so
-// SBSYMCODES needs no lookup at all -- 6.4.10 can just write IDI directly
-// as L raw bits. The runcode header (Table 32) reflects this: only
-// RUNCODE[L] is given a length (1, the only option once it's the sole
-// active code), every other RUNCODE0-34 stays 0 ("never used"). With
-// sbnumsyms == 0 (no real symbol dictionary available to reference), L is
-// -1 so every RUNCODE length stays 0 and the table degenerates to just its
-// fixed 35-entry header, matching an empty text region.
-static int symbol_id_code_len(uint32_t n)
+// B.3's canonical code assignment, mirroring pdfium's
+// CJBig2_Context::HuffmanAssignCode bit for bit: entries of each length get
+// consecutive codes in index order, starting from
+// firstcode[len] = (firstcode[len-1] + count[len-1]) << 1. A length of 0
+// means "no code" -- the entry is skipped, and a decoder can never match it
+// (its match test needs codelen == the number of bits read, always >= 1).
+static void assign_canonical_codes(const std::vector<int> &lens, std::vector<uint32_t> &codes)
 {
-    int L = 0;
-    while ((1u << L) < n)
-        L++;
-    return L < 1 ? 1 : L;
+    codes.assign(lens.size(), 0);
+    int lenmax = 0;
+    for (int l : lens)
+        if (l > lenmax)
+            lenmax = l;
+    std::vector<int> lencounts((size_t)lenmax + 1, 0), firstcodes((size_t)lenmax + 1, 0);
+    for (int l : lens)
+        lencounts[(size_t)l]++;
+    lencounts[0] = 0;
+    for (int i = 1; i <= lenmax; i++) {
+        firstcodes[(size_t)i] = (firstcodes[(size_t)i - 1] + lencounts[(size_t)i - 1]) << 1;
+        int cur = firstcodes[(size_t)i];
+        for (size_t j = 0; j < lens.size(); j++)
+            if (lens[j] == i)
+                codes[j] = (uint32_t)cur++;
+    }
 }
 
-static void write_symbol_id_table(std::vector<uint8_t> &d, uint32_t sbnumsyms, int L)
+// Code lengths for `weights.size()` entries, built by ordinary Huffman
+// construction so they satisfy Kraft equality -- a *complete* prefix code,
+// which is what keeps B.3's canonical assignment collision-free. Falls back
+// to a uniform ceil(log2(n)) length if the tree comes out deeper than
+// max_len (still collision-free, just not maximally compact), since both
+// callers below have a hard ceiling on what they can express: a symbol ID
+// code length is emitted as RUNCODE[length] and so cannot exceed 31, and a
+// runcode's own length goes into a 4-bit field.
+static std::vector<int> huffman_code_lengths(const std::vector<uint32_t> &weights, int max_len)
 {
+    size_t n = weights.size();
+    std::vector<int> lens(n, 0);
+    if (n == 0)
+        return lens;
+    if (n == 1) {
+        lens[0] = 1;   // a lone entry still needs a real (1-bit) code
+        return lens;
+    }
+
+    struct Node { uint64_t w; int left, right, leaf; };
+    std::vector<Node> nodes;
+    std::vector<int> live;
+    for (size_t i = 0; i < n; i++) {
+        nodes.push_back({ weights[i] ? weights[i] : 1, -1, -1, (int)i });
+        live.push_back((int)i);
+    }
+    while (live.size() > 1) {
+        size_t a = 0, b = 1;
+        if (nodes[(size_t)live[b]].w < nodes[(size_t)live[a]].w)
+            std::swap(a, b);
+        for (size_t k = 2; k < live.size(); k++) {
+            if (nodes[(size_t)live[k]].w < nodes[(size_t)live[a]].w) {
+                b = a;
+                a = k;
+            } else if (nodes[(size_t)live[k]].w < nodes[(size_t)live[b]].w) {
+                b = k;
+            }
+        }
+        int ia = live[a], ib = live[b];
+        nodes.push_back({ nodes[(size_t)ia].w + nodes[(size_t)ib].w, ia, ib, -1 });
+        size_t hi = a > b ? a : b, lo = a > b ? b : a;
+        live.erase(live.begin() + (ptrdiff_t)hi);
+        live.erase(live.begin() + (ptrdiff_t)lo);
+        live.push_back((int)nodes.size() - 1);
+    }
+
+    std::vector<std::pair<int, int>> stack{ { live[0], 0 } };
+    while (!stack.empty()) {
+        auto [idx, depth] = stack.back();
+        stack.pop_back();
+        if (nodes[(size_t)idx].leaf >= 0) {
+            lens[(size_t)nodes[(size_t)idx].leaf] = depth < 1 ? 1 : depth;
+            continue;
+        }
+        stack.push_back({ nodes[(size_t)idx].left, depth + 1 });
+        stack.push_back({ nodes[(size_t)idx].right, depth + 1 });
+    }
+
+    int mx = 0;
+    for (int l : lens)
+        if (l > mx)
+            mx = l;
+    if (mx > max_len) {
+        int L = 0;
+        while (((size_t)1 << L) < n)
+            L++;
+        for (int &l : lens)
+            l = L < 1 ? 1 : L;
+    }
+    return lens;
+}
+
+// The symbol ID Huffman table a real text region hands its decoder, plus
+// the list of symbols it is actually allowed to place (7.4.3.1.7 lets a
+// symbol carry code length 0, meaning "no code" -- such a symbol exists in
+// SBSYMS but can never be selected as an IDI).
+struct SymbolIDTable {
+    std::vector<int> len;
+    std::vector<uint32_t> code;
+    std::vector<uint32_t> usable;
+};
+
+// 7.4.3.1.5/.1.7: the text region's symbol ID Huffman decoding table.
+// SBNUMSYMS code lengths, themselves run-length coded with the RUNCODE
+// alphabet of Table 32 and Huffman coded on top of that, preceded by the
+// 35 four-bit RUNCODE lengths. Emitting genuinely varied lengths (rather
+// than giving every symbol the same one, which collapses the table to a
+// single active runcode and a run of identical 1-bit codes) is what makes
+// a decoder actually run B.3's canonical assignment over both alphabets
+// and take Table 32's repeat forms:
+//   RUNCODE32  repeat the previous length 3-6 times   (2 extra bits)
+//   RUNCODE33  repeat length 0 for 3-10 symbols       (3 extra bits)
+//   RUNCODE34  repeat length 0 for 11-138 symbols     (7 extra bits)
+// The field is byte-aligned at the end (step 6) so instance coding starts
+// on a byte boundary.
+static SymbolIDTable write_symbol_id_table(std::vector<uint8_t> &d, uint32_t sbnumsyms)
+{
+    SymbolIDTable t;
+    t.len.assign(sbnumsyms, 0);
+
+    if (sbnumsyms > 0) {
+        // Leave some symbols unusable (code length 0) so runs of zeros --
+        // and with them RUNCODE33/34 -- actually arise. A single wide gap
+        // reaches the longer forms that scattered single zeros never would.
+        std::vector<bool> used(sbnumsyms, true);
+        if (sbnumsyms >= 4 && (urand() & 1)) {
+            uint32_t runlen = 3 + urand() % (sbnumsyms - 3);
+            uint32_t start = urand() % (sbnumsyms - runlen + 1);
+            for (uint32_t i = 0; i < runlen; i++)
+                used[start + i] = false;
+        } else {
+            for (uint32_t i = 0; i < sbnumsyms; i++)
+                used[i] = (urand() % 4) != 0;
+        }
+        std::vector<uint32_t> weights;
+        for (uint32_t i = 0; i < sbnumsyms; i++)
+            if (used[i]) {
+                t.usable.push_back(i);
+                weights.push_back(1 + urand() % 8);
+            }
+        if (t.usable.empty()) {   // every symbol drawn unusable; keep one
+            uint32_t keep = urand() % sbnumsyms;
+            t.usable.push_back(keep);
+            weights.push_back(1);
+        }
+        std::vector<int> ulens = huffman_code_lengths(weights, 15);
+        for (size_t i = 0; i < t.usable.size(); i++)
+            t.len[t.usable[i]] = ulens[i];
+    }
+
+    // Run-length code the lengths into (runcode, extra value, extra bits).
+    struct RunOp { uint32_t code, extra; int extra_bits; };
+    std::vector<RunOp> ops;
+    for (uint32_t i = 0; i < sbnumsyms; ) {
+        int v = t.len[i];
+        uint32_t r = 1;
+        while (i + r < sbnumsyms && t.len[i + r] == v)
+            r++;
+        if (v == 0) {
+            while (r > 0) {
+                if (r >= 11) {
+                    uint32_t take = r > 138 ? 138 : r;
+                    ops.push_back({ 34, take - 11, 7 });
+                    r -= take; i += take;
+                } else if (r >= 3) {
+                    uint32_t take = r > 10 ? 10 : r;
+                    ops.push_back({ 33, take - 3, 3 });
+                    r -= take; i += take;
+                } else {
+                    ops.push_back({ 0, 0, 0 });
+                    r--; i++;
+                }
+            }
+        } else {
+            // The first of a run is always spelled out; only then does
+            // RUNCODE32's "copy the previous length" have a previous to copy.
+            ops.push_back({ (uint32_t)v, 0, 0 });
+            r--; i++;
+            while (r > 0) {
+                if (r >= 3) {
+                    uint32_t take = r > 6 ? 6 : r;
+                    ops.push_back({ 32, take - 3, 2 });
+                    r -= take; i += take;
+                } else {
+                    ops.push_back({ (uint32_t)v, 0, 0 });
+                    r--; i++;
+                }
+            }
+        }
+    }
+
+    // Huffman the RUNCODE alphabet over what those ops actually used.
+    std::vector<uint32_t> runcounts(35, 0);
+    for (const RunOp &op : ops)
+        runcounts[op.code]++;
+    std::vector<uint32_t> rweights;
+    std::vector<uint32_t> rindex;
+    for (uint32_t i = 0; i < 35; i++)
+        if (runcounts[i]) {
+            rindex.push_back(i);
+            rweights.push_back(runcounts[i]);
+        }
+    std::vector<int> runlens(35, 0);
+    std::vector<int> rl = huffman_code_lengths(rweights, 15);
+    for (size_t i = 0; i < rindex.size(); i++)
+        runlens[rindex[i]] = rl[i];
+    std::vector<uint32_t> runcodes;
+    assign_canonical_codes(runlens, runcodes);
+
     BitWriter bw;
     for (int i = 0; i < 35; i++)
-        bw_put_bits(bw, (uint32_t)(i == L ? 1 : 0), 4);
-    for (uint32_t i = 0; i < sbnumsyms; i++)
-        bw_put_bits(bw, 0, 1);   // RUNCODE[L]'s own code: the sole active 1-bit code, value 0
-    bw_finish(bw);
+        bw_put_bits(bw, (uint32_t)runlens[(size_t)i], 4);   // step 1
+    for (const RunOp &op : ops) {
+        bw_put_bits(bw, runcodes[op.code], runlens[op.code]);
+        if (op.extra_bits)
+            bw_put_bits(bw, op.extra, op.extra_bits);
+    }
+    bw_finish(bw);   // step 6: instance coding resumes on a byte boundary
     append(d, bw.bytes.data(), bw.bytes.size());
+
+    assign_canonical_codes(t.len, t.code);   // step 7
+    return t;
 }
 
 // Composites a wi x hi source bitmap onto a dw x dh destination at (dx, dy),
@@ -3342,8 +3542,7 @@ SegResult gen_text_region_real(const std::vector<GeneratedSegment> &prior, bool 
     uint32_t sbnuminstances = sbnumsyms > 0 ? 1 + (urand() % 4) : 0;
     put_be32(d, sbnuminstances);   // 7.4.3.1.4: SBNUMINSTANCES
 
-    int L = sbnumsyms > 0 ? symbol_id_code_len(sbnumsyms) : -1;
-    write_symbol_id_table(d, sbnumsyms, L);   // 7.4.3.1.5/.1.7
+    SymbolIDTable symtab = write_symbol_id_table(d, sbnumsyms);   // 7.4.3.1.5/.1.7
 
     // A real decoder passes one GRCONTEXTS span to every refined instance's
     // generic refinement region decode in this text region (jbig2_trd_proc's
@@ -3418,8 +3617,11 @@ SegResult gen_text_region_real(const std::vector<GeneratedSegment> &prior, bool 
             // 6.4.9: T coordinate -- no bits consumed, SBSTRIPS == 1, and
             // STRIPT is fixed at 0 (see the comment on the initial delta-T
             // below), so TI is always 0 too.
-            uint32_t idi = urand() % sbnumsyms;
-            bw_put_bits(bw, idi, L);   // 6.4.10: symbol ID, L raw bits
+            // 6.4.10: symbol ID, as its SBSYMCODES code. Only a symbol the
+            // table gave a code to can be named -- a zero-length entry has
+            // none, so it stays out of the draw.
+            uint32_t idi = symtab.usable[urand() % symtab.usable.size()];
+            bw_put_bits(bw, symtab.code[idi], symtab.len[idi]);
 
             const ExportedSymbol &sym = all_symbols[idi];
             const uint8_t *place_px = sym.px.data();   // IBI = SBSYMS[IDI] when RI == 0
