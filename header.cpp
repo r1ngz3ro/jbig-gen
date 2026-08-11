@@ -3786,7 +3786,17 @@ SegResult gen_text_region_real(const std::vector<GeneratedSegment> &prior, bool 
             // SBSYMS[IDI] unmodified, needing nothing further here.
             std::vector<uint8_t> refined_cur;   // keeps `place_px` valid past this scope
             if (sbrefine) {
-                bool ri = (urand() & 1) != 0;
+                // SBRTEMPLATE == 1 sends the refinement through pdfium's
+                // DecodeTemplate1Opt, which reads the reference bitmap a
+                // whole byte at a time and does not mask off the bits past
+                // the symbol's real width in a row's last byte -- exactly
+                // the hazard gen_text_region_real_arith() already guards
+                // against, and which this path was missed by. A symbol
+                // exported from a Huffman symbol dictionary can carry
+                // non-zero bits there, so only refine byte-aligned widths
+                // under that template.
+                bool width_safe_for_refine = sbrtemplate != 1 || (sym.w % 8) == 0;
+                bool ri = width_safe_for_refine && (urand() & 1) != 0;
                 bw_put_bits(bw, ri ? 1 : 0, 1);
                 if (ri) {
                     nrefined++;
