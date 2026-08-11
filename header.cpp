@@ -4557,7 +4557,17 @@ SegResult gen_segment_generic_region(const std::vector<GeneratedSegment> &)
     r.data = d;
     // Known exactly only when this segment coded real content; the
     // random-payload branch leaves it empty so nothing refers to it.
-    if (!px.empty()) {
+    //
+    // EXTTEMPLATE content is withheld for the same reason it is kept out of
+    // the page model: pdfium never reads the flag and parses 4 AT pairs for
+    // GBTEMPLATE 0 where 12 were written, so it desyncs and reconstructs
+    // something other than `px`. Leaving the bitmap here would let a later
+    // refinement region take it as GRREFERENCE and encode against pixels no
+    // decoder in this toolchain will have -- measured at a 50% page
+    // mismatch rate for refinements referring to one, and the largest part
+    // of the residual mismatch seen in broad runs. An empty bitmap keeps it
+    // out of refbitmap_pool, so it simply is not offered as a reference.
+    if (!px.empty() && !exttemplate) {
         r.bw = ri.width;
         r.bh = ri.height;
         r.bitmap = std::move(px);
