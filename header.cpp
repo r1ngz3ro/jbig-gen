@@ -1553,16 +1553,24 @@ static size_t mq_measure_generic_bytes(int width, int height, int gbtemplate,
     return dec.byte_idx;
 }
 
-// Trims mq_encode_generic_template0()/mq_encode_generic_template123()'s raw
-// output to exactly the byte count a real decode of GBW x GBH pixels
-// touches -- see mq_measure_generic_bytes()'s comment for why that's
-// smaller than the raw output. Used only by the unknown-length generic
-// region case, which needs its own terminator placed at that exact byte,
-// not the flush's actual end.
-static std::vector<uint8_t> mq_finalize_generic(int width, int height, int gbtemplate,
-                                                   int atx1, int aty1, int atx2, int aty2,
-                                                   int atx3, int aty3, int atx4, int aty4,
-                                                   bool tpgdon, const std::vector<uint8_t> &coded)
+// Where a real decode of GBW x GBH pixels stops inside
+// mq_encode_generic_template0()/mq_encode_generic_template123()'s raw
+// output -- see mq_measure_generic_bytes()'s comment. Only the
+// unknown-length generic region case needs this, to put its terminator at
+// exactly that byte (7.2.7); everything else keeps the encoder's full
+// output.
+//
+// Truncating there is *not* free, which is why it is confined to that one
+// case: the MQ decoder reads a byte or two of lookahead past the position
+// it reports, so cutting the stream at the reported position changes what
+// those lookahead bytes are and the last row or two of the bitmap decode
+// differently. The decode still succeeds -- nothing errors, the pixels are
+// just wrong -- so this only shows up under a pixel-level check, not a
+// pass/fail one.
+static size_t mq_generic_decode_end(int width, int height, int gbtemplate,
+                                        int atx1, int aty1, int atx2, int aty2,
+                                        int atx3, int aty3, int atx4, int aty4,
+                                        bool tpgdon, const std::vector<uint8_t> &coded)
 {
     std::vector<uint8_t> measure_buf = coded;
     measure_buf.push_back(0xFF);
@@ -1570,7 +1578,7 @@ static std::vector<uint8_t> mq_finalize_generic(int width, int height, int gbtem
     size_t consumed = mq_measure_generic_bytes(width, height, gbtemplate,
                                                  atx1, aty1, atx2, aty2, atx3, aty3, atx4, aty4,
                                                  tpgdon, measure_buf.data(), measure_buf.size());
-    return std::vector<uint8_t>(measure_buf.begin(), measure_buf.begin() + (ptrdiff_t)consumed);
+    return consumed < coded.size() ? consumed : coded.size();
 }
 
 void fill_random_pattern(uint8_t *buf, size_t len);
@@ -2068,6 +2076,12 @@ struct SegResult {
     // (not a region segment).
     int32_t region_x = 0;
     int32_t region_y = 0;
+    // Generic regions coding real arithmetic content: the offset into
+    // `data` where a real decode of the region stops. gensegment() cuts the
+    // data back to here when it has to place an unknown-length terminator
+    // (7.2.7) immediately after it; 0 when that does not apply. See
+    // mq_generic_decode_end() for why this is not done unconditionally.
+    size_t arith_trim_to = 0;
     // A real symbol dictionary's exported glyphs (see GeneratedSegment's
     // field of the same name); empty for everything else.
     std::vector<ExportedSymbol> symbols = {};
@@ -2142,6 +2156,33 @@ void init_seg_handlers(void)
 }
 
 // 7.4.1: region segment information field (Figure 30). This common
+// Places one axis of a region relative to the page it will be composed
+// onto. A region whose declared position puts it wholly outside the page
+// contributes nothing -- ComposeTo clips it away -- so drawing each
+// coordinate from the field's full 0..65535 range, as this used to, made
+// regions overlap the page only about one time in six. Y was the culprit
+// almost entirely: choose_page_geometry() caps the page's *area*, so a
+// page is usually only a few hundred rows tall and a Y anywhere in
+// 0..65535 lands below it. Most draws now land on the page, with the
+// off-page shapes kept deliberately, since clipping is worth exercising
+// too: an overhang past either edge for the partial-clip paths, and a
+// placement well past the far edge for clipping to nothing.
+static int32_t region_axis_placement(uint32_t extent, uint32_t page_extent)
+{
+    int64_t pe = (int64_t)page_extent;
+    int64_t ex = (int64_t)extent;
+    switch (urand() % 8) {
+    case 0:   // well past the far edge: clipped away entirely
+        return (int32_t)(pe + 1 + (int64_t)(urand() % 0x1000));
+    case 1:   // overhanging the near edge
+        return (int32_t)(-(1 + (int64_t)(urand() % (uint32_t)(ex > 1 ? ex : 2))));
+    case 2:   // overhanging the far edge
+        return (int32_t)(pe - (int64_t)(urand() % (uint32_t)(ex + 1)));
+    default:  // on the page
+        return (int32_t)(urand() % (page_extent ? page_extent : 1));
+    }
+}
+
 // 17-byte prefix opens the data part of every region segment (text,
 // halftone, generic, generic refinement). Field order:
 //   width, height, X location, Y location, flags.
@@ -2243,11 +2284,17 @@ RegionInfo gen_segment_region_info(bool force_replace, uint32_t max_dim,
     } else if ((urand() & 1) && width >= 64) {
         x = -(int32_t)(1 + urand() % 31);       // remaining width in [33,63]
     } else if (urand() & 1) {
-        x = -(int32_t)(1 + urand() % 32);       // remaining width often <=32
+        // Remaining width often <=32. Clipped by the region's own width so
+        // a narrow region keeps at least one column on the page instead of
+        // vanishing -- "clipped away entirely" is worth generating, but
+        // region_axis_placement() already covers it deliberately.
+        uint32_t clip = width > 1 && width - 1 < 32 ? width - 1 : 32;
+        x = -(int32_t)(1 + urand() % clip);
     } else {
-        x = (int32_t)(urand() & 0xFFFF);
+        x = region_axis_placement(width, g_page_width);
     }
-    int32_t y = force_y != INT64_MIN ? (int32_t)force_y : (int32_t)(urand() & 0xFFFF);
+    int32_t y = force_y != INT64_MIN ? (int32_t)force_y
+                                     : region_axis_placement(height, g_page_height);
     put_be32(d, (uint32_t)x);                 // 7.4.1.3: X location
     put_be32(d, (uint32_t)y);                 // 7.4.1.4: Y location
     // 7.4.1.5 flags: bits 0-2 external combination operator (0 OR,
@@ -4372,6 +4419,7 @@ SegResult gen_segment_generic_region(const std::vector<GeneratedSegment> &)
     }
 
     std::vector<uint8_t> px;
+    size_t arith_trim_to = 0;
     if (mmr || arith_real) {
         // Real coded content: a small synthetic bitmap, genuinely decodable
         // -- via T.6 (6.2.6) for MMR, or the MQ coder (6.2.5.7) for
@@ -4406,25 +4454,24 @@ SegResult gen_segment_generic_region(const std::vector<GeneratedSegment> &)
         // its own terminator + row-count bytes immediately after this
         // segment's data ends, on the assumption that a real decode of
         // exactly GBW x GBH pixels stops right there. It doesn't: mq_flush()
-        // emits its own ordinary MQ-coder flush overhead beyond the byte a
-        // real decode actually needs (verified empirically -- a real decode
-        // stopped 1-8+ bytes short of mq_encode_generic_template0()'s raw
-        // output across sampled cases here), so gensegment()'s terminator
-        // would land mid-flush-overhead, not at the real end, corrupting
-        // everything after (including outright hangs -- this was the ~83%
-        // failure rate a stress run found for unknown-length generic
-        // regions). Trim to the exact byte count mq_finalize_generic()
-        // measures via a faithful self-decode -- same fix as
-        // mq_finalize_refinement() already applies for refinement regions.
-        // Harmless for the known-length case too (still decodes correctly,
-        // just slightly smaller), and EXTTEMPLATE isn't covered (a
-        // different context formula mq_measure_generic_bytes() doesn't
-        // model) -- unknown-length EXTTEMPLATE generic regions keep the
-        // pre-existing bug for now.
+        // emits its own ordinary MQ-coder flush overhead past the byte a
+        // real decode needs, so the terminator would land mid-flush and
+        // corrupt everything after it. Report where a decode really stops
+        // so gensegment() can cut the data back to there -- but only when
+        // it actually needs to, because cutting is lossy: the MQ decoder
+        // reads lookahead past the position it reports, so a truncated
+        // stream decodes its last row or two differently (silently -- the
+        // decode still succeeds). A known-length segment keeps the full
+        // output and stays pixel-exact.
+        //
+        // EXTTEMPLATE is left out: mq_measure_generic_bytes() does not model
+        // its context layout, so unknown-length EXTTEMPLATE regions keep the
+        // pre-existing misplaced terminator.
         if (!mmr && !exttemplate) {
-            coded = mq_finalize_generic((int)ri.width, (int)ri.height, gbtemplate,
-                                         at1.x, at1.y, at2.x, at2.y, at3.x, at3.y, at4.x, at4.y,
-                                         tpgdon, coded);
+            arith_trim_to = d.size()
+                            + mq_generic_decode_end((int)ri.width, (int)ri.height, gbtemplate,
+                                                     at1.x, at1.y, at2.x, at2.y,
+                                                     at3.x, at3.y, at4.x, at4.y, tpgdon, coded);
         }
         append(d, coded.data(), coded.size());
     } else {
@@ -4450,6 +4497,7 @@ SegResult gen_segment_generic_region(const std::vector<GeneratedSegment> &)
     r.combop = ri.combop;
     r.ext_template = exttemplate;
     r.mmr = mmr;
+    r.arith_trim_to = arith_trim_to;
     // Every branch above codes the full declared height: the two real ones
     // encode exactly ri.height rows, and the random-payload branch stands
     // in for data that would. 7.4.6.4 permits a segment to carry fewer
@@ -4988,6 +5036,7 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
     std::vector<StdHuffLine> table_rows;
     uint32_t hdpw = 0;
     int32_t region_x = 0, region_y = 0;
+    size_t arith_trim_to = 0;
     if (has_data) {
         SegResult r = gensegmentdata(type, 256, g_prior_segments);
         data = std::move(r.data);
@@ -5006,6 +5055,7 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
         hdpw = r.hdpw;
         region_x = r.region_x;
         region_y = r.region_y;
+        arith_trim_to = r.arith_trim_to;
     }
     uint32_t data_len = (uint32_t)data.size();
 
@@ -5020,7 +5070,16 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
     // modelled -- and, carrying random payload, fails to decode and takes
     // the rest of the file with it anyway -- so it just retires the model.
     if (is_immediate_direct_region(type)) {
-        if (g_page_state_known && !bitmap.empty() && combop >= 0) {
+        // An EXTTEMPLATE generic region is spec-correct on the wire but no
+        // decoder in this toolchain implements EXTTEMPLATE: pdfium never
+        // reads the flag and always parses 4 AT pairs for GBTEMPLATE 0, so
+        // the 12 pairs written here desync it and whatever it composes onto
+        // the page is not what this segment encodes. The page after one is
+        // therefore not predictable *here*, however conformant the segment
+        // itself is.
+        if (ext_template)
+            g_page_state_known = false;
+        else if (g_page_state_known && !bitmap.empty() && combop >= 0) {
             compose_bitmap(g_page_bitmap, g_page_width, g_page_height,
                             bitmap.data(), bw, bh, region_x, region_y, (uint8_t)combop);
         } else {
@@ -5041,6 +5100,11 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
                        g_organisation != ORG_RANDOM_ACCESS && (urand() & 1);
 
     if (unknown_len) {
+        // The terminator has to sit exactly where a decode stops, so cut
+        // the encoder's flush overhead back to there first. Only done here,
+        // for the segments that need it -- see mq_generic_decode_end().
+        if (arith_trim_to && arith_trim_to < data.size())
+            data.resize(arith_trim_to);
         // With an unknown length, 7.4.6.4 says the data part ends with a
         // terminator plus a 4-byte row count (the number of rows *actually*
         // encoded, no greater than the declared bitmap height -- comes from
