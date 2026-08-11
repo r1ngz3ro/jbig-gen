@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 // xorshift32 PRNG. Seeded once from /dev/urandom and never returns to the
@@ -1791,6 +1792,15 @@ bool g_page_height_unknown = false;
 // the content loop (its flags are derived from the content), by which time
 // any end of stripe segment has already had to know the maximum stripe size
 // it must not exceed.
+// --dump-page reports page 1, because that is the page the harness asks
+// pdfium to decode and pdfium stops at its end of page segment
+// (jbig2_context.cpp:389 returns kEndReached), so later pages cannot affect
+// it. The model is snapshotted when page 1 finishes, before a second page
+// resets the globals.
+std::vector<uint8_t> g_dump_bitmap;
+uint32_t g_dump_width = 0, g_dump_height = 0;
+bool g_dump_default_pixel = false;
+bool g_dump_valid = false;
 bool g_page_striped = false;
 uint32_t g_page_max_stripe = 0;
 uint32_t g_last_stripe_end = 0;
@@ -1874,6 +1884,11 @@ size_t g_segment_len = 0;
 // picking meaningless numbers.
 std::vector<GeneratedSegment> g_prior_segments;
 uint32_t g_next_segment_number = 0;
+// D.4.2 bits 2-3 are a property of the whole file, but g_prior_segments only
+// ever holds the segments the *current* page may refer to (7.2.6), so these
+// accumulate as segments are made instead of being scanned for at the end.
+bool g_any_ext_template = false;
+bool g_any_colored = false;
 
 // The segment type gensegment() is currently building. A handler serves
 // several types at once (one refinement-region handler covers 40, 42 and
@@ -5543,6 +5558,10 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
     // Make this segment visible to later gensegment() calls as a possible
     // referent, now that its own refs (which could only point to earlier
     // segments) are settled.
+    if (ext_template)
+        g_any_ext_template = true;
+    if (colored)
+        g_any_colored = true;
     g_prior_segments.push_back({ segment_number, type,
                                   (uint32_t)(forced_page >= 0 ? forced_page : 0),
                                   colored, combop, (uint32_t)refs.size(), num_symbols, ext_template,
@@ -5853,14 +5872,6 @@ int main(int argc, char **argv)
     }
     Knubs k = knubs();
 
-    // Settle the page geometry before any content is generated, so region
-    // placement has a page to aim at and g_page_bitmap can track what a
-    // decoder's page buffer holds -- gen_segment_page_info() below just
-    // reports what this chose. (Its segment number is reserved further up
-    // and its bytes are built last, so the page information segment still
-    // lands first in the file, per 7.4.8.)
-    choose_page_geometry();
-
     // 7.4.12: if a profiles segment is present, it must be the very first
     // segment of the data stream, and must not be associated with any page.
     if (urand() & 1) {
@@ -5868,7 +5879,32 @@ int main(int argc, char **argv)
         push_segment(profiles);
     }
 
-    // Build one coherent page (page number 1). 7.4.8 requires the page
+    // Most files hold one page; some hold several. Each is built the same
+    // way and simply carries its own page association.
+    uint32_t number_of_pages = (urand() % 4 == 0) ? 2 + (urand() % 3) : 1;
+
+    for (uint32_t page_number = 1; page_number <= number_of_pages; page_number++) {
+    // 7.2.6: "A segment that has a non-zero segment page association may only
+    // be referred to by segments having the same segment page association
+    // value as it." g_prior_segments is exactly the pool later segments draw
+    // references from, so anything belonging to a page now finished has to
+    // leave it; page 0 segments stay, being referable from anywhere. The
+    // page information handler's content scan narrows the same way for free,
+    // which is what keeps its derived flags about *this* page.
+    g_prior_segments.erase(std::remove_if(g_prior_segments.begin(), g_prior_segments.end(),
+                                          [](const GeneratedSegment &sg) { return sg.page != 0; }),
+                            g_prior_segments.end());
+    g_claimed_intermediate_regions.clear();
+
+    // Settle the page geometry before any content is generated, so region
+    // placement has a page to aim at and g_page_bitmap can track what a
+    // decoder's page buffer holds -- gen_segment_page_info() below just
+    // reports what this chose. (Its segment number is reserved just below
+    // and its bytes are built last, so the page information segment still
+    // lands first for its page, per 7.4.8.)
+    choose_page_geometry();
+
+    // 7.4.8 requires the page
     // information segment to be the first segment associated with the
     // page, so its segment number is reserved here, before any content —
     // but its actual bytes are built after the content loop below (once
@@ -5970,18 +6006,18 @@ int main(int argc, char **argv)
             // refers to nothing and always fits.
             if (!type_mandatory_refs_available(t))
                 t = SEG_IMMEDIATE_GENERIC;
-            std::vector<std::vector<uint8_t> *> seg = gensegment(t, 1);
+            std::vector<std::vector<uint8_t> *> seg = gensegment(t, (int32_t)page_number);
             push_segment(seg);
         }
     } else {
         for (size_t i = 0; i < ncontent; i++) {
-            std::vector<std::vector<uint8_t> *> seg = gensegment(-1, 1);
+            std::vector<std::vector<uint8_t> *> seg = gensegment(-1, (int32_t)page_number);
             push_segment(seg);
         }
     }
 
     std::vector<std::vector<uint8_t> *> page_info =
-        gensegment(SEG_PAGE_INFORMATION, 1, page_info_number);
+        gensegment(SEG_PAGE_INFORMATION, (int32_t)page_number, page_info_number);
     header_streams.insert(header_streams.begin() + page_info_pos, page_info[0]);
     data_streams.insert(data_streams.begin() + page_info_pos, page_info[1]);
 
@@ -5993,14 +6029,27 @@ int main(int argc, char **argv)
     // before the end of page segment, satisfies both halves at once.
     if (g_page_height_unknown) {
         g_last_stripe_end = g_page_height ? g_page_height - 1 : 0;
-        std::vector<std::vector<uint8_t> *> eos = gensegment(SEG_END_OF_STRIPE, 1);
+        std::vector<std::vector<uint8_t> *> eos =
+            gensegment(SEG_END_OF_STRIPE, (int32_t)page_number);
         push_segment(eos);
     }
 
     // 7.4.9: each page must have exactly one end of page segment associated
     // with it, and it must be the last segment associated with that page.
-    std::vector<std::vector<uint8_t> *> end_of_page = gensegment(SEG_END_OF_PAGE, 1);
+    std::vector<std::vector<uint8_t> *> end_of_page =
+        gensegment(SEG_END_OF_PAGE, (int32_t)page_number);
     push_segment(end_of_page);
+
+    // Page 1's model is the one --dump-page reports; take it before the next
+    // page resets the geometry.
+    if (page_number == 1) {
+        g_dump_valid = g_page_state_known;
+        g_dump_bitmap = g_page_bitmap;
+        g_dump_width = g_page_width;
+        g_dump_height = g_page_height;
+        g_dump_default_pixel = g_page_default_pixel;
+    }
+    }   // end of per-page loop
 
     // D.2: random-access organization requires the file's last segment to
     // be an end of file segment (7.4.11), unassociated with any page.
@@ -6018,15 +6067,9 @@ int main(int argc, char **argv)
     // file's first bytes) is built last and relies on
     // assemble_org_order()/serialize_out() running afterward to place it
     // correctly.
-    k.use_12_AT = false;
-    k.colored_region = false;
-    for (const auto &seg : g_prior_segments) {
-        if (seg.ext_template)
-            k.use_12_AT = true;
-        if (seg.colored)
-            k.colored_region = true;
-    }
-    genheader(org, k, 1, write_header);   // main() builds exactly one page (page number 1)
+    k.use_12_AT = g_any_ext_template;
+    k.colored_region = g_any_colored;
+    genheader(org, k, number_of_pages, write_header);
 
     assemble_org_order(org);
 
@@ -6038,20 +6081,20 @@ int main(int argc, char **argv)
     // `pix = ~pix`, PDF's ImageMask convention), and the bits past the page
     // width carry the default pixel value Fill() left there, inverted the
     // same way -- both are part of matching the file jbig2dec writes.
-    if (dump_page_path && g_page_state_known) {
+    if (dump_page_path && g_dump_valid) {
         FILE *pf = fopen(dump_page_path, "wb");
         if (pf) {
-            fprintf(pf, "P4\n%u %u\n", g_page_width, g_page_height);
-            size_t row_bytes = (g_page_width + 7) / 8;
+            fprintf(pf, "P4\n%u %u\n", g_dump_width, g_dump_height);
+            size_t row_bytes = (g_dump_width + 7) / 8;
             std::vector<uint8_t> row(row_bytes);
-            for (uint32_t y = 0; y < g_page_height; y++) {
+            for (uint32_t y = 0; y < g_dump_height; y++) {
                 // Padding bits past the page width keep whatever Fill()
                 // put there (the default pixel), and the decoder's final
                 // whole-buffer inversion flips them too.
-                row.assign(row_bytes, g_page_default_pixel ? 0x00 : 0xFF);
-                for (uint32_t x = 0; x < g_page_width; x++) {
+                row.assign(row_bytes, g_dump_default_pixel ? 0x00 : 0xFF);
+                for (uint32_t x = 0; x < g_dump_width; x++) {
                     uint8_t m = (uint8_t)(0x80 >> (x % 8));
-                    if (!g_page_bitmap[(size_t)y * g_page_width + x])
+                    if (!g_dump_bitmap[(size_t)y * g_dump_width + x])
                         row[x / 8] |= m;
                     else
                         row[x / 8] &= (uint8_t)~m;
