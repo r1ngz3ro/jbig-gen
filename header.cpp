@@ -2161,8 +2161,56 @@ RegionInfo gen_segment_region_info(bool force_replace, uint32_t max_dim,
     // choose: a refinement region reusing another segment's bitmap as
     // GRREFERENCE must declare that bitmap's exact size, since the decoder
     // samples the reference over this region's own extent (6.3.5.3).
-    uint32_t width = force_w ? force_w : 1 + (urand() % max_dim);
-    uint32_t height = force_h ? force_h : 1 + (urand() % max_dim);
+    //
+    // A freely-chosen size is capped by *area*, not just per dimension, for
+    // the same reason choose_page_geometry() caps the page: a decoder has
+    // to walk every pixel of whatever this declares. pdfium's own guard
+    // (CJBig2_Image::IsValidImageSize) only bounds each dimension at 65535
+    // and never the product, so two independent draws land squarely in a
+    // band -- 20480 x 4095, say -- that is accepted and then costs ~83
+    // million arithmetic decisions, seconds per segment, for a region whose
+    // content is random payload nobody can decode anyway. Either dimension
+    // may still span the full range as long as the other gives way, so
+    // wide-and-short and tall-and-narrow shapes stay reachable.
+    static const uint32_t MAX_REGION_PIXELS = 1u << 18;   // 256K pixels
+    uint32_t width, height;
+    if (max_dim >= 0x10000 && (urand() % 16) == 0) {
+        // Keep the "declared size a decoder must refuse outright" case:
+        // past 65535 IsValidImageSize rejects before anything is allocated
+        // or decoded, so this stays cheap -- unlike the accepted-but-huge
+        // band above, which is what the area cap exists to avoid.
+        width = force_w ? force_w : 0x10000 + (urand() % 1000);
+        height = force_h ? force_h : 0x10000 + (urand() % 1000);
+    } else if (urand() & 1) {
+        // Width first, height yielding: wide-and-short.
+        width = force_w ? force_w : 1 + (urand() % max_dim);
+        if (force_h) {
+            height = force_h;
+        } else {
+            uint32_t max_h = MAX_REGION_PIXELS / width;
+            if (max_h == 0)
+                max_h = 1;
+            if (max_h > max_dim)
+                max_h = max_dim;
+            height = 1 + (urand() % max_h);
+        }
+    } else {
+        // Height first, width yielding: tall-and-narrow. Drawing the same
+        // dimension first every time would make the *other* one collapse to
+        // a handful of pixels whenever the first came out large, so one
+        // orientation would effectively never appear.
+        height = force_h ? force_h : 1 + (urand() % max_dim);
+        if (force_w) {
+            width = force_w;
+        } else {
+            uint32_t max_w = MAX_REGION_PIXELS / height;
+            if (max_w == 0)
+                max_w = 1;
+            if (max_w > max_dim)
+                max_w = max_dim;
+            width = 1 + (urand() % max_w);
+        }
+    }
     put_be32(d, width);                       // 7.4.1.1: bitmap width
     put_be32(d, height);                      // 7.4.1.2: bitmap height
     // 7.4.1.3: X location. ParseRegionInfo (jbig2_context.cpp) reads this
