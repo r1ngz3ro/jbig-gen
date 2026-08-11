@@ -1673,6 +1673,21 @@ struct GeneratedSegment {
     uint32_t nrefs;        // size of this segment's own referred-to list
     uint32_t num_symbols;  // symbol dictionary: SDNUMEXSYMS, else 0
     bool ext_template;     // true if a generic region set EXTTEMPLATE (7.4.6.2)
+    // True when this segment's `bitmap` is an exact model of the region but
+    // the decoder's own buffer for it holds pixels beyond the declared width
+    // that this generator cannot predict -- so it must not be handed to a
+    // refinement region as GRREFERENCE. A text region is filled with
+    // SBDEFPIXEL before any symbol is placed, and pdfium's CJBig2_Image::Fill
+    // writes whole bytes, so with SBDEFPIXEL=1 and a width that is not a
+    // multiple of 8 the padding bits of every row come back set. 6.3.5.3 puts
+    // pixels outside the reference at 0, which is what the encoder here
+    // assumes, but CJBig2_GRRDProc's optimized paths read the reference a
+    // byte at a time and never mask those bits off -- the same padding hazard
+    // DecodeTemplate1Opt showed for symbol refinement. Measured: refining
+    // against such a region mismatched the page oracle 37/250 (14.8%) of the
+    // time, against 0/43 when the width was byte-aligned, 0/264 with
+    // SBDEFPIXEL=0, and 0/2257 for an intermediate generic reference.
+    bool ref_padding_dirty;
     // The bitmap this segment decodes to, when the generator coded real
     // content and so knows it exactly (empty when the data part was random
     // payload). One byte per pixel, row-major, bw x bh. Only an
@@ -2118,6 +2133,10 @@ struct SegResult {
     int combop = -1;            // region external combination operator (0-4), or -1 if not a region segment
     uint32_t num_symbols = 0;   // symbol dictionary: SDNUMEXSYMS, else 0
     bool ext_template = false;  // true if this is a generic region with EXTTEMPLATE set
+    // Set when `bitmap` is exact but the *decoder's* copy of it carries
+    // pixels past the declared width that this generator cannot reproduce,
+    // making it unsafe as a GRREFERENCE. See GeneratedSegment's copy.
+    bool ref_padding_dirty = false;
     // Generic regions only, for the unknown-length trailer gensegment()
     // appends (7.2.7). Reported by the handler rather than recovered by
     // re-parsing the bytes it just wrote, so the trailer cannot drift out
@@ -3902,6 +3921,10 @@ SegResult gen_text_region_real(const std::vector<GeneratedSegment> &prior, bool 
     r.bw = ri.width;
     r.bh = ri.height;
     r.bitmap = std::move(canvas);
+    // SBDEFPIXEL=1 with a width that is not byte-aligned leaves the decoder's
+    // own buffer with set bits past the declared width; see
+    // GeneratedSegment::ref_padding_dirty.
+    r.ref_padding_dirty = sbdefpixel && (ri.width % 8) != 0;
     return r;
 }
 
@@ -4105,6 +4128,10 @@ SegResult gen_text_region_real_arith(const std::vector<GeneratedSegment> &prior,
     r.bw = ri.width;
     r.bh = ri.height;
     r.bitmap = std::move(canvas);
+    // SBDEFPIXEL=1 with a width that is not byte-aligned leaves the decoder's
+    // own buffer with set bits past the declared width; see
+    // GeneratedSegment::ref_padding_dirty.
+    r.ref_padding_dirty = sbdefpixel && (ri.width % 8) != 0;
     return r;
 }
 
@@ -4620,7 +4647,7 @@ SegResult gen_segment_refinement_region(const std::vector<GeneratedSegment> &pri
         switch (seg.type) {
         case SEG_INTERMEDIATE_GENERIC: case SEG_INTERMEDIATE_GENERIC_REFINEMENT:
         case SEG_INTERMEDIATE_TEXT:
-            if (!seg.bitmap.empty())
+            if (!seg.bitmap.empty() && !seg.ref_padding_dirty)
                 refbitmap_pool.push_back(seg.number);
             [[fallthrough]];
         case SEG_INTERMEDIATE_HALFTONE:
@@ -5153,6 +5180,7 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
     int combop = -1;
     uint32_t num_symbols = 0;
     bool ext_template = false;
+    bool ref_padding_dirty = false;
     bool mmr = false;
     uint32_t region_rows = 0;
     uint32_t bw = 0, bh = 0;
@@ -5170,6 +5198,7 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
         combop = r.combop;
         num_symbols = r.num_symbols;
         ext_template = r.ext_template;
+        ref_padding_dirty = r.ref_padding_dirty;
         mmr = r.mmr;
         region_rows = r.region_rows;
         bw = r.bw;
@@ -5295,7 +5324,7 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
     g_prior_segments.push_back({ segment_number, type,
                                   (uint32_t)(forced_page >= 0 ? forced_page : 0),
                                   colored, combop, (uint32_t)refs.size(), num_symbols, ext_template,
-                                  bw, bh, std::move(bitmap), std::move(symbols), std::move(table_rows), hdpw });
+                                  ref_padding_dirty, bw, bh, std::move(bitmap), std::move(symbols), std::move(table_rows), hdpw });
 
     std::vector<std::vector<uint8_t> *> parts;
     parts.push_back(hdr);
