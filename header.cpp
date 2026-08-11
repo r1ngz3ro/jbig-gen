@@ -5246,6 +5246,30 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
         //    "0x00 0x00" marker there (as 7.4.6.4's terminator convention
         //    literally describes) inserts 2 bytes nothing ever skips,
         //    misaligning the row count and everything after it.
+        //
+        // AMBIGUITY(mmr-unknown-length): the MMR case above is not a spec
+        // reading we can defend -- it is a deliberate accommodation of a
+        // pdfium bug, and the two cannot be reconciled. 7.4.6.4 does require
+        // the terminator, and Ghostscript's jbig2dec (alt/jbig2dec1) reads it
+        // the literal way: jbig2.c:376 scans forward from byte 18 for the
+        // method's marker (0x00 0x00 for MMR, 0xFF 0xAC for arithmetic), then
+        // takes the 4 bytes after it as the row count AND derives the whole
+        // segment's data_length from where that scan landed. Because the
+        // declared length is 0xFFFFFFFF, both decoders locate every *later*
+        // segment relative to this point, so a 2-byte disagreement desyncs
+        // the rest of the file -- there is no encoding that satisfies both.
+        // Measured over 150 unknown-length-MMR files each way:
+        //    no marker (what we do): pdfium 150/150, jbig2dec 74/150,
+        //                            33 of those "segment contains more rows
+        //                            than stated" -- jbig2dec's scan locks
+        //                            onto the 0x00 0x00 that begins our own
+        //                            big-endian row count and reads garbage
+        //    marker (per 7.4.6.4):   pdfium  63/150, jbig2dec 77/150,
+        //                            0 row-count errors
+        // Kept as-is so the primary oracle keeps full coverage of this path.
+        // Recorded rather than fixed: a spot where conforming implementations
+        // provably diverge is worth generating *for* later, deliberately, not
+        // just working around. Tag other such spots AMBIGUITY(<name>).
         if (!mmr) {
             static const uint8_t term_arith[2] = { 0xFF, 0xAC };
             append(data, term_arith, 2);
