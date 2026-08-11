@@ -1624,6 +1624,28 @@ typedef enum {
     SEG_EXTENSION = 62
 } SegmentType;
 
+// 8.2 step 5a/5c/5d: the region segment types combined straight into the
+// page buffer with their own external combination operator. The
+// *intermediate* types (4, 20, 36, 40) are excluded deliberately: those
+// are decoded into an auxiliary buffer and only reach the page later, via
+// whatever refinement region refers to them (step 5b/5e).
+static bool is_immediate_direct_region(uint8_t type)
+{
+    switch (type) {
+    case SEG_IMMEDIATE_TEXT:
+    case SEG_IMMEDIATE_LOSSLESS_TEXT:
+    case SEG_IMMEDIATE_HALFTONE:
+    case SEG_IMMEDIATE_LOSSLESS_HALFTONE:
+    case SEG_IMMEDIATE_GENERIC:
+    case SEG_IMMEDIATE_LOSSLESS_GENERIC:
+    case SEG_IMMEDIATE_GENERIC_REFINEMENT:
+    case SEG_IMMEDIATE_LOSSLESS_GENERIC_REFINEMENT:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // One symbol dictionary entry's exact pixels, in export order -- see the
 // `symbols` field below.
 struct ExportedSymbol {
@@ -1684,6 +1706,66 @@ Knubs knubs(void)
     k.use_12_AT = urand() % 2;
     k.colored_region = urand() % 2;
     return k;
+}
+
+// This run's page geometry, and a running model of the page buffer's
+// contents. Every other page field gen_segment_page_info() derives after
+// the fact (main() builds that segment's bytes last, once content is
+// known), but the geometry has to be settled *before* content generation:
+// a region's placement is only meaningful relative to a page that already
+// has a size, and one segment type -- a generic refinement region that
+// refers to no other segment (7.4.7.4) -- reads the page buffer back as
+// its GRREFERENCE, so it can only encode real content if it knows both
+// where the page is and what is already on it.
+uint32_t g_page_width = 0;
+uint32_t g_page_height = 0;
+bool g_page_default_pixel = false;
+// One byte per pixel, row-major, g_page_width x g_page_height: exactly
+// what a decoder's page buffer holds after every content segment emitted
+// so far has been composed onto it (8.2 step 5). pdfium's page buffer is
+// supplied by the harness (CJBig2_Context::GetFirstPage sets
+// buf_specified_), so the "page grows on an end-of-stripe" path
+// (page_->Expand) is guarded off and the page keeps these exact
+// dimensions for the whole file -- nothing here has to model striping.
+std::vector<uint8_t> g_page_bitmap;
+// Cleared once anything is emitted whose effect on the page buffer this
+// generator cannot reproduce -- a region segment carrying random payload,
+// say. Such a segment also makes the whole file fail to decode (pdfium
+// stops at the first failing segment), so the page state after it is moot;
+// this only stops a later segment from *claiming* to know it.
+bool g_page_state_known = true;
+
+// 7.4.8.1/.2 + case 48's page_->Fill(default pixel): the state a decoder's
+// page buffer is in before any region segment composes onto it.
+static void page_state_init(uint32_t width, uint32_t height, bool default_pixel)
+{
+    g_page_width = width;
+    g_page_height = height;
+    g_page_default_pixel = default_pixel;
+    g_page_bitmap.assign((size_t)width * height, default_pixel ? 1 : 0);
+    g_page_state_known = true;
+}
+
+// Draws 7.4.8.1/.2's page width and height, and 7.4.8.5 bit 2's default
+// pixel value. Unlike a region's declared size, these drive an actual
+// page-buffer allocation, so the *product* matters: two independent
+// 1..0x10000 draws reach 2^32 pixels and decoders refuse the page outright
+// (pdfium caps a bitmap at INT_MAX - 31), killing the file before any
+// content segment is reached. Cap the area instead, letting either
+// dimension still span its full range as long as the other gives way --
+// and keep the total small enough that g_page_bitmap's byte-per-pixel
+// model stays cheap.
+static void choose_page_geometry(void)
+{
+    static const uint32_t MAX_PAGE_PIXELS = 1u << 22;   // 4M pixels
+    uint32_t width = 1 + (urand() % 0x10000);
+    uint32_t max_height = MAX_PAGE_PIXELS / width;
+    if (max_height == 0)
+        max_height = 1;
+    if (max_height > 0x10000)
+        max_height = 0x10000;
+    uint32_t height = 1 + (urand() % max_height);
+    page_state_init(width, height, (urand() & 1) != 0);
 }
 
 std::vector<uint8_t> stream;
@@ -1980,6 +2062,12 @@ struct SegResult {
     uint32_t bw = 0;
     uint32_t bh = 0;
     std::vector<uint8_t> bitmap = {};
+    // Where a region segment declared itself on the page (7.4.1.3/.1.4),
+    // so gensegment() can compose `bitmap` onto its model of the page
+    // buffer exactly where a decoder will. Meaningless when combop is -1
+    // (not a region segment).
+    int32_t region_x = 0;
+    int32_t region_y = 0;
     // A real symbol dictionary's exported glyphs (see GeneratedSegment's
     // field of the same name); empty for everything else.
     std::vector<ExportedSymbol> symbols = {};
@@ -1998,13 +2086,20 @@ struct RegionInfo {
     uint8_t combop;
     uint32_t width;
     uint32_t height;
+    // 7.4.1.3/.1.4, as the decoder reads them: a raw 32-bit field stored
+    // into an int32_t, so a large unsigned value here really is a negative
+    // placement. Carried out so gensegment() can compose this region onto
+    // its model of the page buffer at the same spot a decoder will.
+    int32_t x;
+    int32_t y;
 };
 
 SegResult gen_segment_page_info(const std::vector<GeneratedSegment> &prior);
 SegResult gen_segment_extension(const std::vector<GeneratedSegment> &prior);
 SegResult gen_segment_pattern_dict(const std::vector<GeneratedSegment> &prior);
 RegionInfo gen_segment_region_info(bool force_replace = false, uint32_t max_dim = 0x10000,
-                                     uint32_t force_w = 0, uint32_t force_h = 0);
+                                     uint32_t force_w = 0, uint32_t force_h = 0,
+                                     int64_t force_x = INT64_MIN, int64_t force_y = INT64_MIN);
 SegResult gen_segment_symbol_dict(const std::vector<GeneratedSegment> &prior);
 SegResult gen_symbol_dict_real(void);
 SegResult gen_segment_text_region(const std::vector<GeneratedSegment> &prior);
@@ -2058,7 +2153,8 @@ void init_seg_handlers(void)
 // can actually afford to generate/encode; the 0x10000 default matches the
 // page-size cap used elsewhere for callers that don't have that constraint.
 RegionInfo gen_segment_region_info(bool force_replace, uint32_t max_dim,
-                                     uint32_t force_w, uint32_t force_h)
+                                     uint32_t force_w, uint32_t force_h,
+                                     int64_t force_x, int64_t force_y)
 {
     std::vector<uint8_t> d;
     // A caller passes force_w/force_h when the region's size is not free to
@@ -2088,15 +2184,24 @@ RegionInfo gen_segment_region_info(bool force_replace, uint32_t max_dim,
     // leaving it to chance -- a clip comparable to the whole width, or a
     // region under 64 pixels wide to begin with, can only ever land back
     // in the single-word family regardless of the clip's own alignment.
+    // force_x/force_y pin the placement instead, for a caller that needs
+    // the region to land somewhere specific on the page -- a
+    // reference-less refinement region taking GRREFERENCE from the page
+    // buffer has to sit fully inside it, or the reference it encoded
+    // against is not the sub-image the decoder will sample.
     int32_t x;
-    if ((urand() & 1) && width >= 64)
+    if (force_x != INT64_MIN) {
+        x = (int32_t)force_x;
+    } else if ((urand() & 1) && width >= 64) {
         x = -(int32_t)(1 + urand() % 31);       // remaining width in [33,63]
-    else if (urand() & 1)
+    } else if (urand() & 1) {
         x = -(int32_t)(1 + urand() % 32);       // remaining width often <=32
-    else
+    } else {
         x = (int32_t)(urand() & 0xFFFF);
+    }
+    int32_t y = force_y != INT64_MIN ? (int32_t)force_y : (int32_t)(urand() & 0xFFFF);
     put_be32(d, (uint32_t)x);                 // 7.4.1.3: X location
-    put_be32(d, urand() & 0xFFFF);            // 7.4.1.4: Y location
+    put_be32(d, (uint32_t)y);                 // 7.4.1.4: Y location
     // 7.4.1.5 flags: bits 0-2 external combination operator (0 OR,
     // 1 AND, 2 XOR, 3 XNOR, 4 REPLACE); bit 3 COLEXTFLAG; bits 4-7
     // reserved, must be 0.
@@ -2111,7 +2216,7 @@ RegionInfo gen_segment_region_info(bool force_replace, uint32_t max_dim,
         flags |= 0x08;
     d.push_back(flags);
     printf("region-info handler (%zu bytes, colored=%d combop=%u)\n", d.size(), color, combop);
-    return { d, color, combop, width, height };
+    return { d, color, combop, width, height, x, y };
 }
 
 // 7.4.8: page information data part.
@@ -2125,23 +2230,12 @@ RegionInfo gen_segment_region_info(bool force_replace, uint32_t max_dim,
 SegResult gen_segment_page_info(const std::vector<GeneratedSegment> &prior)
 {
     std::vector<uint8_t> d;
-    // 7.4.8.1/.2: page width and height. Unlike a region's declared size,
-    // these drive an actual page-buffer allocation, so the *product*
-    // matters: two independent 1..0x10000 draws reach 2^32 pixels and
-    // decoders refuse the page outright (pdfium caps a bitmap at
-    // INT_MAX - 31), killing the file before any content segment is
-    // reached. Cap the area instead, letting either dimension still span
-    // its full range as long as the other gives way.
-    static const uint32_t MAX_PAGE_PIXELS = 1u << 22;   // 4M pixels
-    uint32_t page_width = 1 + (urand() % 0x10000);
-    uint32_t max_height = MAX_PAGE_PIXELS / page_width;
-    if (max_height == 0)
-        max_height = 1;
-    if (max_height > 0x10000)
-        max_height = 0x10000;
-    uint32_t page_height = 1 + (urand() % max_height);
-    put_be32(d, page_width);
-    put_be32(d, page_height);
+    // 7.4.8.1/.2: page width and height -- drawn by choose_page_geometry()
+    // before any content segment (see g_page_width), not here, because
+    // region placement has to be able to aim at a page that already has a
+    // size. This segment only reports them.
+    put_be32(d, g_page_width);
+    put_be32(d, g_page_height);
     put_be32(d, 1 + (urand() % 300));         // x resolution
     put_be32(d, 1 + (urand() % 300));         // y resolution
 
@@ -2199,14 +2293,17 @@ SegResult gen_segment_page_info(const std::vector<GeneratedSegment> &prior)
     // operator (0-3: OR/AND/XOR/XNOR), bit 5 requires auxiliary buffers,
     // bit 6 combination operator overridden, bit 7 might contain coloured
     // segment. Bits 1, 5, 6, 7 and the combop in bits 3-4 are derived from
-    // this page's actual content above; bits 0 and 2 have no content-level
-    // rule to derive from, so they're left random.
+    // this page's actual content above; bit 0 has no content-level rule to
+    // derive from, so it's left random. Bit 2 reports the default pixel
+    // value choose_page_geometry() already made -- the page buffer is
+    // filled with it before any region composes onto it, so it is part of
+    // the page state g_page_bitmap models, not a free choice here.
     uint8_t flags = 0;
     if (urand() & 1)
         flags |= 0x01;
     if (has_refinement)
         flags |= 0x02;
-    if (urand() & 1)
+    if (g_page_default_pixel)
         flags |= 0x04;
     if (page_combop > 3) {   // would overflow bits 3-4 into "requires auxiliary buffers"
         fprintf(stderr, "gen_segment_page_info: page default combop %u exceeds bits 3-4\n", page_combop);
@@ -3423,6 +3520,8 @@ SegResult gen_text_region_real(const std::vector<GeneratedSegment> &prior, bool 
     r.data = d;
     r.refs = refs;
     r.colored = ri.colored;
+    r.region_x = ri.x;
+    r.region_y = ri.y;
     r.combop = ri.combop;
     // The full composited region bitmap, exactly as a decoder's ComposeTo()
     // calls would leave it -- only useful to a later segment when *this*
@@ -3632,6 +3731,8 @@ SegResult gen_text_region_real_arith(const std::vector<GeneratedSegment> &prior,
     r.data = d;
     r.refs = refs;
     r.colored = ri.colored;
+    r.region_x = ri.x;
+    r.region_y = ri.y;
     r.combop = ri.combop;
     r.bw = ri.width;
     r.bh = ri.height;
@@ -3745,7 +3846,14 @@ SegResult gen_segment_text_region(const std::vector<GeneratedSegment> &prior)
         refs.push_back(t);
 
     printf("text-region handler (%zu bytes, %zu refs, structural)\n", d.size(), refs.size());
-    return { d, refs, ri.colored, ri.combop };
+    SegResult r;
+    r.data = d;
+    r.refs = refs;
+    r.colored = ri.colored;
+    r.combop = ri.combop;
+    r.region_x = ri.x;
+    r.region_y = ri.y;
+    return r;
 }
 
 // 7.4.5.1: halftone region segment data header (Figure 43). Starts with
@@ -3948,6 +4056,8 @@ SegResult gen_segment_halftone_region(const std::vector<GeneratedSegment> &prior
     r.data = d;
     r.refs = refs;
     r.colored = ri.colored;
+    r.region_x = ri.x;
+    r.region_y = ri.y;
     r.combop = ri.combop;
     return r;
 }
@@ -4085,6 +4195,8 @@ SegResult gen_segment_generic_region(const std::vector<GeneratedSegment> &)
         r.bitmap = std::move(px);
     }
     r.colored = ri.colored;
+    r.region_x = ri.x;
+    r.region_y = ri.y;
     r.combop = ri.combop;
     r.ext_template = exttemplate;
     r.mmr = mmr;
@@ -4168,18 +4280,62 @@ SegResult gen_segment_refinement_region(const std::vector<GeneratedSegment> &pri
     bool tpgron = (urand() & 1) != 0;
     bool arith_real = refs.empty() || refseg;
 
+    // With no referred-to region, the decoder builds GRREFERENCE out of the
+    // page buffer itself -- page_->SubImage(x, y, w, h) in
+    // ParseGenericRefinementRegion -- so this region can only code real
+    // content if it knows both where it sits on the page and what is
+    // already there. Exactly two placements make that knowable:
+    //
+    //  - Fully inside the page: the reference is the tracked g_page_bitmap
+    //    rectangle. Width is held to a multiple of 32 and X to a byte
+    //    boundary so SubImage's row copy moves whole bytes of real page
+    //    content and its result's stride comes out exactly the region
+    //    width -- no padding bits, which the per-pixel encoder here (and
+    //    every other refinement caller) treats as 0 and would otherwise
+    //    disagree about.
+    //  - Entirely off the page: SubImage's own bounds check (x >= width_)
+    //    returns early with an all-zero bitmap of the requested size. That
+    //    needs no page tracking at all, so it stands in whenever the page
+    //    state is unknown or the page is too small to place inside.
+    //
+    // Left to a free placement the region would usually land *partly* on
+    // the page, where the reference is a mix of real content and
+    // out-of-bounds zero padding that no invented pattern reproduces --
+    // which is what made this path fail (and, at large declared sizes,
+    // grind) before.
+    uint32_t ref_force_w = 0, ref_force_h = 0;
+    int64_t ref_force_x = INT64_MIN, ref_force_y = INT64_MIN;
+    bool page_ref_inside = false;
+    if (!refseg && refs.empty()) {
+        uint32_t maxw = g_page_width < 128 ? g_page_width : 128;
+        uint32_t maxh = g_page_height < 128 ? g_page_height : 128;
+        if (g_page_state_known && maxw >= 32) {
+            ref_force_w = 32 * (1 + urand() % (maxw / 32));
+            ref_force_h = 1 + urand() % maxh;
+            uint32_t xslots = (g_page_width - ref_force_w) / 8;
+            ref_force_x = (int64_t)(8 * (urand() % (xslots + 1)));
+            ref_force_y = (int64_t)(urand() % (g_page_height - ref_force_h + 1));
+            page_ref_inside = true;
+        } else {
+            ref_force_w = 1 + urand() % 128;
+            ref_force_h = 1 + urand() % 128;
+            ref_force_x = (int64_t)g_page_width + (int64_t)(urand() % 1024);
+            ref_force_y = (int64_t)(urand() % 0x10000);
+        }
+    }
+
     // 7.4.7.5 step 1: if this segment refers to no other region segment,
     // its external combination operator must be REPLACE. With a reference
     // the region must declare that reference bitmap's exact size, since the
     // decoder samples GRREFERENCE over this region's own extent (6.3.5.3).
     // 128, matching gen_segment_generic_region()'s own real-content cap and
     // for the same reason (headroom past a negative-X left clip) --
-    // moot when refseg forces an exact size below, since force_w/force_h
-    // override this entirely.
+    // moot whenever a forced size below overrides it entirely.
     RegionInfo ri = gen_segment_region_info(/*force_replace=*/refs.empty(),
                                               arith_real ? 128 : 0x10000,
-                                              refseg ? refseg->bw : 0,
-                                              refseg ? refseg->bh : 0);
+                                              refseg ? refseg->bw : ref_force_w,
+                                              refseg ? refseg->bh : ref_force_h,
+                                              ref_force_x, ref_force_y);
     std::vector<uint8_t> d = ri.bytes;
 
     uint8_t flags = grtemplate;
@@ -4216,19 +4372,18 @@ SegResult gen_segment_refinement_region(const std::vector<GeneratedSegment> &pri
             // it makes this region decode to exactly `cur`, rather than
             // merely decoding without error.
             ref = refseg->bitmap;
-        } else {
-            // No reference: the decoder derives GRREFERENCE from page-buffer
-            // state instead, which this generator does not track, so the
-            // reference is invented. Decode success rides on the context
-            // layout matching, not on those pixels agreeing. Coarse blocks
-            // rather than a fine checkerboard, so the reference has uniform
-            // 3x3 neighbourhoods for TPGRON's typical-prediction path to
-            // actually skip -- a checkerboard is typical nowhere and would
-            // leave that path coded but never exercised.
+        } else if (page_ref_inside) {
+            // GRREFERENCE is the page buffer's own contents under this
+            // region, which the placement above put fully in bounds -- so
+            // SubImage hands the decoder exactly this rectangle.
             for (uint32_t y = 0; y < ri.height; y++)
                 for (uint32_t x = 0; x < ri.width; x++)
-                    ref[(size_t)y * ri.width + x] = (uint8_t)(((x >> 2) + (y >> 2)) & 1);
+                    ref[(size_t)y * ri.width + x] =
+                        g_page_bitmap[(size_t)((uint32_t)ri.y + y) * g_page_width
+                                      + ((uint32_t)ri.x + x)];
         }
+        // Otherwise the region sits off the page entirely and SubImage
+        // returns an all-zero bitmap -- which `ref` already is.
         std::vector<uint8_t> coded = mq_encode_refinement(
             (int)ri.width, (int)ri.height, cur.data(), ref.data(),
             grtemplate, tpgron, at1.x, at1.y, at2.x, at2.y);
@@ -4253,14 +4408,16 @@ SegResult gen_segment_refinement_region(const std::vector<GeneratedSegment> &pri
         d.push_back(0xFF);
         d.push_back(0xFF);
         // mq_encode_refinement() rewrites `cur` where TPGRON skipped a
-        // pixel, so it now holds what a decoder actually reconstructs --
-        // exactly right only when GRREFERENCE was real, which is also the
-        // only case a later segment may refer back to.
-        if (refseg) {
-            r.bw = ri.width;
-            r.bh = ri.height;
-            r.bitmap = std::move(cur);
-        }
+        // pixel, so it now holds exactly what a decoder reconstructs --
+        // true for every real-content case here, since each one encoded
+        // against the GRREFERENCE the decoder will really have (a
+        // referred-to region's bitmap, the page rectangle under this
+        // region, or the all-zero bitmap SubImage returns off-page). Carry
+        // it up for both uses: as a later segment's GRREFERENCE, and as
+        // what gensegment() composes onto its model of the page.
+        r.bw = ri.width;
+        r.bh = ri.height;
+        r.bitmap = std::move(cur);
     } else {
         // Coded refinement bitmap data, not modeled.
         append_random_payload(d, 256);
@@ -4272,6 +4429,8 @@ SegResult gen_segment_refinement_region(const std::vector<GeneratedSegment> &pri
     r.data = d;
     r.refs = refs;
     r.colored = ri.colored;
+    r.region_x = ri.x;
+    r.region_y = ri.y;
     r.combop = ri.combop;
     return r;
 }
@@ -4578,6 +4737,7 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
     std::vector<ExportedSymbol> symbols;
     std::vector<StdHuffLine> table_rows;
     uint32_t hdpw = 0;
+    int32_t region_x = 0, region_y = 0;
     if (has_data) {
         SegResult r = gensegmentdata(type, 256, g_prior_segments);
         data = std::move(r.data);
@@ -4594,8 +4754,29 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
         symbols = std::move(r.symbols);
         table_rows = std::move(r.table_rows);
         hdpw = r.hdpw;
+        region_x = r.region_x;
+        region_y = r.region_y;
     }
     uint32_t data_len = (uint32_t)data.size();
+
+    // 8.2 step 5a: an immediate *direct* region segment's decoded bitmap is
+    // combined straight into the page buffer using that region's own
+    // external combination operator (an intermediate one goes to an
+    // auxiliary buffer instead, and never reaches the page on its own).
+    // Mirroring that here keeps g_page_bitmap in step with what a decoder
+    // holds, which is what lets a later reference-less refinement region
+    // encode against the page it will really sample (7.4.7.4). A region
+    // whose content this generator did not code exactly cannot be
+    // modelled -- and, carrying random payload, fails to decode and takes
+    // the rest of the file with it anyway -- so it just retires the model.
+    if (is_immediate_direct_region(type)) {
+        if (g_page_state_known && !bitmap.empty() && combop >= 0) {
+            compose_bitmap(g_page_bitmap, g_page_width, g_page_height,
+                            bitmap.data(), bw, bh, region_x, region_y, (uint8_t)combop);
+        } else {
+            g_page_state_known = false;
+        }
+    }
 
     // 7.2.7: an immediate generic region *may* declare an unknown data
     // length, recoverable only by scanning for the trailer appended below.
@@ -4741,14 +4922,23 @@ int main(int argc, char **argv)
     // test cases) don't have to keep regenerating until they get lucky.
     enum { HEADER_RANDOM, HEADER_FORCE_ON, HEADER_FORCE_OFF } header_mode = HEADER_RANDOM;
     const char *out_path = "out.jb2";
+    // --dump-page writes the page this run believes it built, in exactly
+    // the P4 PBM layout jbig2dec emits, so the two can be compared
+    // byte-for-byte: a decoder that reconstructs a different page than the
+    // generator intended is a bug even when it reports success. Nothing is
+    // written when the page state is unknown (see g_page_state_known).
+    const char *dump_page_path = nullptr;
     bool out_path_set = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--header") == 0) {
             header_mode = HEADER_FORCE_ON;
         } else if (strcmp(argv[i], "--no-header") == 0) {
             header_mode = HEADER_FORCE_OFF;
+        } else if (strcmp(argv[i], "--dump-page") == 0 && i + 1 < argc) {
+            dump_page_path = argv[++i];
         } else if (argv[i][0] == '-' || out_path_set) {
-            fprintf(stderr, "Usage: %s [out_path] [--header|--no-header]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [out_path] [--header|--no-header] [--dump-page <path.pbm>]\n",
+                    argv[0]);
             return 1;
         } else {
             out_path = argv[i];
@@ -4796,6 +4986,14 @@ int main(int argc, char **argv)
         break;
     }
     Knubs k = knubs();
+
+    // Settle the page geometry before any content is generated, so region
+    // placement has a page to aim at and g_page_bitmap can track what a
+    // decoder's page buffer holds -- gen_segment_page_info() below just
+    // reports what this chose. (Its segment number is reserved further up
+    // and its bytes are built last, so the page information segment still
+    // lands first in the file, per 7.4.8.)
+    choose_page_geometry();
 
     // 7.4.12: if a profiles segment is present, it must be the very first
     // segment of the data stream, and must not be associated with any page.
@@ -4868,6 +5066,36 @@ int main(int argc, char **argv)
     assemble_org_order(org);
 
     serialize_out(stream.data(), stream.size(), out_path);
+
+    // --dump-page: the page this run believes it built, in jbig2dec's own
+    // P4 PBM layout. Bits come out inverted because pdfium's decoder flips
+    // its whole output buffer once decoding finishes (jbig2_decoder.cpp's
+    // `pix = ~pix`, PDF's ImageMask convention), and the bits past the page
+    // width carry the default pixel value Fill() left there, inverted the
+    // same way -- both are part of matching the file jbig2dec writes.
+    if (dump_page_path && g_page_state_known) {
+        FILE *pf = fopen(dump_page_path, "wb");
+        if (pf) {
+            fprintf(pf, "P4\n%u %u\n", g_page_width, g_page_height);
+            size_t row_bytes = (g_page_width + 7) / 8;
+            std::vector<uint8_t> row(row_bytes);
+            for (uint32_t y = 0; y < g_page_height; y++) {
+                // Padding bits past the page width keep whatever Fill()
+                // put there (the default pixel), and the decoder's final
+                // whole-buffer inversion flips them too.
+                row.assign(row_bytes, g_page_default_pixel ? 0x00 : 0xFF);
+                for (uint32_t x = 0; x < g_page_width; x++) {
+                    uint8_t m = (uint8_t)(0x80 >> (x % 8));
+                    if (!g_page_bitmap[(size_t)y * g_page_width + x])
+                        row[x / 8] |= m;
+                    else
+                        row[x / 8] &= (uint8_t)~m;
+                }
+                fwrite(row.data(), 1, row_bytes, pf);
+            }
+            fclose(pf);
+        }
+    }
 
     if (k.colored_region)
         printf("Colored region\n");
