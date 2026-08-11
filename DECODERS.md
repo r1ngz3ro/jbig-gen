@@ -133,6 +133,24 @@ is computed from the same wrong offset, so every read stays inside what was
 validated. It is a pure misparse -- but a total one for the affected segment
 and everything after it.
 
+Confirmed by forcing exact reference counts and round-tripping the parsed
+list against the intended one -- 284 observations, no exceptions, and the
+split falls exactly where the arithmetic predicts:
+
+| R | round-tripped exactly | desynced |
+|---|---|---|
+| 5 | 0 | 61 |
+| 6 | 0 | 61 |
+| **7** | **60** | **0** |
+| 8 | 0 | 61 |
+| 14 | 0 | 14 |
+| **15** | **7** | **0** |
+| 16 | 0 | 10 |
+
+R = 7 and R = 15 are the values where floor and ceil agree. Every other R
+above 4 desyncs every time, which rules out any explanation other than the
+rounding.
+
 It went unnoticed because nothing normally emits R > 4. Our generator did not
 either until the reference caps were raised; the long-form branch was
 reachable in PDFium and jbig2dec but never taken.
