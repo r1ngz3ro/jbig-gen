@@ -3568,6 +3568,68 @@ static SymbolIDTable write_symbol_id_table(std::vector<uint8_t> &d, uint32_t sbn
 // implements the same clip-then-combine semantics through 32-bit-word
 // bit-twiddling for speed; the per-pixel result is identical, only the
 // implementation strategy differs.
+// 6.4.5 step 3c(x): where an instance's bitmap lands, given the running S
+// coordinate, its strip's T coordinate, and REFCORNER -- plus how far CURS
+// advances afterwards. Mirrors pdfium's GetComposeData()
+// (jbig2_trd_proc.cpp) exactly, including which corners carry the advance,
+// because both handlers below have to leave their composited region bitmap
+// holding precisely what a decoder's own ComposeTo() calls would produce.
+//
+// TRANSPOSED swaps the roles of the two axes: S runs down the region rather
+// than across it, so T becomes the horizontal coordinate. The corner
+// constants are pdfium's JBig2Corner (0 BL, 1 TL, 2 BR, 3 TR).
+struct TextPlacement {
+    int32_t x;
+    int32_t y;
+    int32_t increment;
+};
+static TextPlacement text_placement(int32_t si, int32_t ti, uint32_t wi, uint32_t hi,
+                                     uint8_t refcorner, bool transposed)
+{
+    TextPlacement p = { 0, 0, 0 };
+    int32_t w = (int32_t)wi, h = (int32_t)hi;
+    if (!transposed) {
+        switch (refcorner) {
+        case 1: p.x = si;         p.y = ti;         p.increment = w - 1; break;  // TOPLEFT
+        case 3: p.x = si - w + 1; p.y = ti;                              break;  // TOPRIGHT
+        case 0: p.x = si;         p.y = ti - h + 1; p.increment = w - 1; break;  // BOTTOMLEFT
+        default:p.x = si - w + 1; p.y = ti - h + 1;                      break;  // BOTTOMRIGHT
+        }
+    } else {
+        switch (refcorner) {
+        case 1: p.x = ti;         p.y = si;         p.increment = h - 1; break;  // TOPLEFT
+        case 3: p.x = ti - w + 1; p.y = si;         p.increment = h - 1; break;  // TOPRIGHT
+        case 0: p.x = ti;         p.y = si - h + 1;                      break;  // BOTTOMLEFT
+        default:p.x = ti - w + 1; p.y = si - h + 1;                      break;  // BOTTOMRIGHT
+        }
+    }
+    return p;
+}
+
+// 6.4.5 step 3c(vi): CURS advances *before* the placement is derived when
+// REFCORNER names the far edge along the S axis -- the right edge while S
+// runs across (TRANSPOSED 0), the bottom edge while it runs down
+// (TRANSPOSED 1). The advance is WI-1 in the first case and HI-1 in the
+// second. Getting either half backwards silently staggers every instance
+// after the first, which is why this and text_placement() are kept adjacent.
+static bool text_pre_advance(uint8_t refcorner, bool transposed)
+{
+    return transposed ? (refcorner == 0 || refcorner == 2)    // BOTTOMLEFT, BOTTOMRIGHT
+                      : (refcorner == 2 || refcorner == 3);   // BOTTOMRIGHT, TOPRIGHT
+}
+
+// 7.4.3.1.1 bits 2-3 hold LOGSBSTRIPS, so SBSTRIPS is 1, 2, 4 or 8. The
+// number of raw bits an SBHUFF text region spends on each instance's CURT
+// is derived the way pdfium derives it (jbig2_trd_proc.cpp:117-122): start
+// at 1 and grow until 1<<n reaches SBSTRIPS.
+static uint32_t curt_bits_for(uint32_t sbstrips)
+{
+    uint32_t n = 1;
+    while ((1u << n) < sbstrips)
+        n++;
+    return n;
+}
+
 static void compose_bitmap(std::vector<uint8_t> &dst, uint32_t dw, uint32_t dh,
                             const uint8_t *src, uint32_t sw, uint32_t sh,
                             int32_t dx, int32_t dy, uint8_t op)
@@ -3672,22 +3734,38 @@ SegResult gen_text_region_real(const std::vector<GeneratedSegment> &prior, bool 
     uint8_t sbrtemplate = sbrefine ? (uint8_t)(urand() % 2) : 0;
 
     // 7.4.3.1.1: text region segment flags. SBHUFF=1 (bit 0), SBREFINE
-    // (bit 1), LOGSBSTRIPS=0 i.e. SBSTRIPS=1 (bits 2-3), REFCORNER random
-    // (bits 4-5), TRANSPOSED=0 (bit 6), SBCOMBOP random (bits 7-8),
-    // SBDEFPIXEL random (bit 9), SBDSOFFSET=0 (bits 10-14, kept simple),
-    // SBRTEMPLATE (bit 15). refcorner/sbcombop/sbdefpixel are kept as named
-    // values (not just folded into `flags`) because the composited region
-    // bitmap built below needs them too.
+    // (bit 1), LOGSBSTRIPS (bits 2-3), REFCORNER random (bits 4-5),
+    // TRANSPOSED (bit 6), SBCOMBOP random (bits 7-8), SBDEFPIXEL random
+    // (bit 9), SBDSOFFSET (bits 10-14, signed 5-bit), SBRTEMPLATE (bit 15).
+    // Everything the composited region bitmap below also needs is kept as a
+    // named value rather than only folded into `flags`.
     uint8_t refcorner = (uint8_t)(urand() % 4);   // JBig2Corner: 0 BL, 1 TL, 2 BR, 3 TR
     uint8_t sbcombop = (uint8_t)(urand() % 4);
     bool sbdefpixel = (urand() & 1) != 0;
+    // SBSTRIPS is 1, 2, 4 or 8; each instance then carries its own CURT
+    // within the strip (6.4.9), which is what makes T vary per instance
+    // instead of being pinned to the strip's own T.
+    uint8_t logsbstrips = (uint8_t)(urand() % 4);
+    uint32_t sbstrips = 1u << logsbstrips;
+    bool transposed = (urand() & 1) != 0;
+    // 7.4.3.1.1 bits 10-14 are a *signed* 5-bit SBDSOFFSET, so -16..15. It
+    // is added to CURS on every instance after the first (6.4.8), and a
+    // negative one can walk CURS backwards -- legal, and it makes instances
+    // overlap, which compose_bitmap()/ComposeTo() both handle by clipping.
+    int32_t sbdsoffset = (int32_t)(urand() % 32);
+    if (sbdsoffset > 15)
+        sbdsoffset -= 32;
     uint16_t flags = 0x0001;
     if (sbrefine)
         flags |= 0x0002;
+    flags |= (uint16_t)((uint32_t)logsbstrips << 2);
     flags |= (uint16_t)(refcorner << 4);
+    if (transposed)
+        flags |= 0x0040;
     flags |= (uint16_t)(sbcombop << 7);
     if (sbdefpixel)
         flags |= 0x0200;
+    flags |= (uint16_t)((uint32_t)(sbdsoffset & 0x1F) << 10);
     flags |= (uint16_t)((uint32_t)sbrtemplate << 15);
     put_be16(d, flags);
 
@@ -3755,17 +3833,11 @@ SegResult gen_text_region_real(const std::vector<GeneratedSegment> &prior, bool 
     // only SBHUFFDT choices (Table 33), all start at 1, so 0 has no
     // representation -- the spec's own worked example likewise codes an
     // initial value of 1 to reach a first strip at STRIPT + delta.
-    // 6.4.5-8's placement math, replicated here so the composited region
-    // bitmap below (r.bitmap) ends up holding exactly what a decoder's own
-    // ComposeTo() calls would produce -- see GetComposeData()
-    // (jbig2_trd_proc.cpp) for the TRANSPOSED==0 formulas this mirrors:
-    // FIRSTS/CURS track the same running S position a decoder maintains,
-    // and a right-aligned REFCORNER shifts CURS by WI-1 *before* deriving
-    // the placement X, while a left-aligned one shifts it *after* (via
-    // `increment`) -- getting either half backwards silently staggers
-    // every instance after the first.
-    bool right_corner = (refcorner == 2 || refcorner == 3);   // BOTTOMRIGHT, TOPRIGHT
-    bool bottom_corner = (refcorner == 0 || refcorner == 2);  // BOTTOMLEFT, BOTTOMRIGHT
+    // FIRSTS/CURS track the same running S position a decoder maintains;
+    // text_placement()/text_pre_advance() hold the rest of 6.4.5-8's
+    // placement math, so that r.bitmap below ends up holding exactly what a
+    // decoder's own ComposeTo() calls would produce.
+    bool pre_advance = text_pre_advance(refcorner, transposed);
     int32_t firsts = 0, curs = 0;
     std::vector<uint8_t> canvas((size_t)ri.width * ri.height, sbdefpixel ? 1 : 0);
 
@@ -3787,11 +3859,17 @@ SegResult gen_text_region_real(const std::vector<GeneratedSegment> &prior, bool 
             } else {
                 int32_t ids = (int32_t)(urand() % 8);
                 huff_encode(bw, ds_table, ids);   // 6.4.8: subsequent S coordinate
-                curs += ids;   // SBDSOFFSET == 0
+                curs += ids + sbdsoffset;
             }
-            // 6.4.9: T coordinate -- no bits consumed, SBSTRIPS == 1, and
-            // STRIPT is fixed at 0 (see the comment on the initial delta-T
-            // below), so TI is always 0 too.
+            // 6.4.9: T coordinate. STRIPT is 0 (see the initial delta-T
+            // comment above), so TI is just this instance's own CURT --
+            // spent as raw bits, and only when SBSTRIPS != 1.
+            int32_t ti = 0;
+            if (sbstrips != 1) {
+                uint32_t curt = urand() % sbstrips;
+                bw_put_bits(bw, curt, curt_bits_for(sbstrips));
+                ti = (int32_t)curt;
+            }
             // 6.4.10: symbol ID, as its SBSYMCODES code. Only a symbol the
             // table gave a code to can be named -- a zero-length entry has
             // none, so it stays out of the draw.
@@ -3885,15 +3963,12 @@ SegResult gen_text_region_real(const std::vector<GeneratedSegment> &prior, bool 
                 }
             }
 
-            if (right_corner)
-                curs += (int32_t)sym.w - 1;
-            int32_t si = curs;
-            int32_t dst_x = right_corner ? si - (int32_t)sym.w + 1 : si;
-            int32_t dst_y = bottom_corner ? -(int32_t)sym.h + 1 : 0;   // TI == 0
+            if (pre_advance)
+                curs += (int32_t)(transposed ? sym.h : sym.w) - 1;
+            TextPlacement p = text_placement(curs, ti, sym.w, sym.h, refcorner, transposed);
             compose_bitmap(canvas, ri.width, ri.height, place_px, sym.w, sym.h,
-                           dst_x, dst_y, sbcombop);
-            if (!right_corner)
-                curs += (int32_t)sym.w - 1;
+                           p.x, p.y, sbcombop);
+            curs += p.increment;
         }
         huff_encode(bw, ds_table, OOB_VAL);   // end of strip
     }
@@ -3972,20 +4047,29 @@ SegResult gen_text_region_real_arith(const std::vector<GeneratedSegment> &prior,
     uint8_t sbrtemplate = sbrefine ? (uint8_t)(urand() % 2) : 0;
 
     // 7.4.3.1.1: text region segment flags. SBHUFF=0 (bit 0), SBREFINE
-    // (bit 1), LOGSBSTRIPS=0 i.e. SBSTRIPS=1 (bits 2-3), REFCORNER random
-    // (bits 4-5), TRANSPOSED=0 (bit 6), SBCOMBOP random (bits 7-8),
-    // SBDEFPIXEL random (bit 9), SBDSOFFSET=0 (bits 10-14), SBRTEMPLATE
-    // (bit 15).
+    // (bit 1), LOGSBSTRIPS (bits 2-3), REFCORNER random (bits 4-5),
+    // TRANSPOSED (bit 6), SBCOMBOP random (bits 7-8), SBDEFPIXEL random
+    // (bit 9), SBDSOFFSET (bits 10-14, signed 5-bit), SBRTEMPLATE (bit 15).
     uint8_t refcorner = (uint8_t)(urand() % 4);
     uint8_t sbcombop = (uint8_t)(urand() % 4);
     bool sbdefpixel = (urand() & 1) != 0;
+    uint8_t logsbstrips = (uint8_t)(urand() % 4);
+    uint32_t sbstrips = 1u << logsbstrips;
+    bool transposed = (urand() & 1) != 0;
+    int32_t sbdsoffset = (int32_t)(urand() % 32);
+    if (sbdsoffset > 15)
+        sbdsoffset -= 32;
     uint16_t flags = 0x0000;
     if (sbrefine)
         flags |= 0x0002;
+    flags |= (uint16_t)((uint32_t)logsbstrips << 2);
     flags |= (uint16_t)(refcorner << 4);
+    if (transposed)
+        flags |= 0x0040;
     flags |= (uint16_t)(sbcombop << 7);
     if (sbdefpixel)
         flags |= 0x0200;
+    flags |= (uint16_t)((uint32_t)(sbdsoffset & 0x1F) << 10);
     flags |= (uint16_t)((uint32_t)sbrtemplate << 15);
     put_be16(d, flags);
 
@@ -4014,7 +4098,7 @@ SegResult gen_text_region_real_arith(const std::vector<GeneratedSegment> &prior,
     // is one persistent context across the whole region, matching
     // JBig2IntDecoderState's single set of decoders (jbig2_trd_proc.h).
     MQEncoder mq;
-    ArithIntCtx iadt, iafs, iads, iari, iardw, iardh, iardx, iardy;
+    ArithIntCtx iadt, iafs, iads, iait, iari, iardw, iardh, iardx, iardy;
     std::vector<uint8_t> iaid_cx(1u << sbsymcodelen, 0);
     std::vector<uint8_t> refine_cx_state;
     if (sbrefine)
@@ -4028,6 +4112,7 @@ SegResult gen_text_region_real_arith(const std::vector<GeneratedSegment> &prior,
     std::vector<uint8_t> canvas((size_t)ri.width * ri.height, sbdefpixel ? 1 : 0);
 
     uint32_t nrefined = 0;
+    bool pre_advance = text_pre_advance(refcorner, transposed);
     // 6.4.5 step 2/4b: INITIAL STRIPT and this (one) strip's own delta T
     // are both coded as plain 0 -- arithmetic integer coding has no
     // B.11-B.13-style "can't represent 0" gap the way those standard
@@ -4045,10 +4130,16 @@ SegResult gen_text_region_real_arith(const std::vector<GeneratedSegment> &prior,
             } else {
                 int32_t ids = (int32_t)(urand() % 8);
                 mq_encode_arith_int(mq, iads, ids);   // 6.4.8: subsequent S coordinate
-                curs += ids;   // SBDSOFFSET == 0
+                curs += ids + sbdsoffset;
             }
-            // 6.4.9: T coordinate -- SBSTRIPS == 1 skips IAIT entirely
-            // (jbig2_trd_proc.cpp:322), so TI is always STRIPT (== 0) too.
+            // 6.4.9: T coordinate. STRIPT is 0, so TI is this instance's own
+            // CURT -- coded through IAIT, and only when SBSTRIPS != 1
+            // (jbig2_trd_proc.cpp:322 skips the decode entirely otherwise).
+            int32_t ti = 0;
+            if (sbstrips != 1) {
+                ti = (int32_t)(urand() % sbstrips);
+                mq_encode_arith_int(mq, iait, ti);
+            }
             uint32_t idi = urand() % sbnumsyms;
             mq_encode_arith_iaid(mq, iaid_cx, sbsymcodelen, idi);   // 6.4.10
 
@@ -4099,15 +4190,12 @@ SegResult gen_text_region_real_arith(const std::vector<GeneratedSegment> &prior,
                 }
             }
 
-            if (right_corner)
-                curs += (int32_t)sym.w - 1;
-            int32_t si = curs;
-            int32_t dst_x = right_corner ? si - (int32_t)sym.w + 1 : si;
-            int32_t dst_y = bottom_corner ? -(int32_t)sym.h + 1 : 0;   // TI == 0
+            if (pre_advance)
+                curs += (int32_t)(transposed ? sym.h : sym.w) - 1;
+            TextPlacement p = text_placement(curs, ti, sym.w, sym.h, refcorner, transposed);
             compose_bitmap(canvas, ri.width, ri.height, place_px, sym.w, sym.h,
-                           dst_x, dst_y, sbcombop);
-            if (!right_corner)
-                curs += (int32_t)sym.w - 1;
+                           p.x, p.y, sbcombop);
+            curs += p.increment;
         }
         mq_encode_arith_int(mq, iads, 0, /*oob=*/true);   // end of strip
     }
