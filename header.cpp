@@ -5,6 +5,8 @@
 #include <string>
 #include <algorithm>
 #include <vector>
+#include <unistd.h>
+#include <sys/wait.h>
 
 // xorshift32 PRNG. Seeded once from /dev/urandom and never returns to the
 // kernel, unlike the previous per-call urandom read which dominated
@@ -1826,6 +1828,36 @@ static bool intermediate_region_claimed(uint32_t number)
     return false;
 }
 
+// --mutate-depth>=2 support: when set (>=0), gen_segment_refinement_region()
+// uses this segment number as its sole reference instead of drawing from
+// refbitmap_pool/region_pool -- this is how main() forces a specific
+// refinement segment to refer to the specific intermediate text region
+// plan_build_deep_chain() built for it, rather than whichever unclaimed
+// intermediate region the normal draw would otherwise pick.
+int64_t g_forced_single_ref = -1;
+
+// Segment numbers a deep chain has earmarked for its own designated
+// referrer only. Filtered out of every *other* refinement's candidate
+// pools so an independently-generated RefineUnit elsewhere in the same
+// plan can't claim the chain's intermediate region first.
+std::vector<uint32_t> g_reserved_intermediate_numbers;
+
+// --mutate-depth=3 only: forces gen_segment_text_region() to give this
+// segment a deliberately unusual declared geometry instead of its normal
+// draw. Set by main() for exactly the gensegment() call corresponding to
+// the deep chain's second text region. Declared up here, ahead of
+// gen_segment_text_region() itself, rather than alongside g_mutate_depth
+// further down, purely so it's in scope where it's used.
+bool g_geometry_force = false;
+
+static bool intermediate_region_reserved(uint32_t number)
+{
+    for (uint32_t n : g_reserved_intermediate_numbers)
+        if (n == number)
+            return true;
+    return false;
+}
+
 // 7.4.8.1/.2 + case 48's page_->Fill(default pixel): the state a decoder's
 // page buffer is in before any region segment composes onto it.
 static void page_state_init(uint32_t width, uint32_t height, bool default_pixel)
@@ -2013,6 +2045,13 @@ static std::vector<uint32_t> pick_refs(const std::vector<uint32_t> &pool,
 // what Annex D.1/D.2 require.
 std::vector<std::vector<uint8_t> *> header_streams;
 std::vector<std::vector<uint8_t> *> data_streams;
+
+// --globals-out: the same two pointer streams, for segments routed to a
+// separate JBIG2Globals-style file instead of the main one (see main()).
+// Kept apart so assemble_org_order()'s single-file logic doesn't need to
+// know the split exists.
+std::vector<std::vector<uint8_t> *> globals_header_streams;
+std::vector<std::vector<uint8_t> *> globals_data_streams;
 
 // The organization chosen for this run. gensegment() consults it because
 // D.2's random-access layout constrains what a segment header may declare
@@ -3183,11 +3222,11 @@ SegResult gen_symbol_dict_real_refagg(const std::vector<GeneratedSegment> &prior
     // reference, but SDNUMINSYMS still has to be the true count for
     // SBSYMCODELEN (IDI's bit width, jbig2_sdd_proc.cpp:350-354) and the
     // export run-lengths below to come out right.
-    const ExportedSymbol *seed = nullptr;
+    const std::vector<ExportedSymbol> *imported_syms = nullptr;
     uint32_t sdnuminsyms = 0;
     for (const auto &seg : prior)
         if (seg.number == import_from && !seg.symbols.empty()) {
-            seed = &seg.symbols[0];
+            imported_syms = &seg.symbols;
             sdnuminsyms = seg.num_symbols;
             break;
         }
@@ -3196,6 +3235,12 @@ SegResult gen_symbol_dict_real_refagg(const std::vector<GeneratedSegment> &prior
         sbsymcodelen++;
 
     std::vector<uint8_t> d;
+
+    // REFAGGNINST: 1..min(4, sdnuminsyms). When > 1 the new symbol is built
+    // by composing multiple imported symbols onto a collective bitmap
+    // (6.5.8.2.1), exercising the aggregation decode path instead of the
+    // simple refinement one.
+    uint32_t refagginst = 1 + (urand() % (sdnuminsyms < 4 ? sdnuminsyms : 4));
 
     // GRTEMPLATE == 1 refinement here always hits pdfium's
     // DecodeTemplate1Opt (GRW == SYMWIDTH == seed->w == GRREFERENCE->width()
@@ -3206,7 +3251,7 @@ SegResult gen_symbol_dict_real_refagg(const std::vector<GeneratedSegment> &prior
     // identical guard for the full explanation. Only allow SDRTEMPLATE == 1
     // when the seed's width is byte-aligned, so no row has a partial last
     // byte for Opt to misread.
-    uint8_t sdrtemplate = (seed->w % 8 == 0) ? (uint8_t)(urand() % 2) : 0;
+    uint8_t sdrtemplate = (imported_syms->front().w % 8 == 0) ? (uint8_t)(urand() % 2) : 0;
 
     // 7.4.2.1.1: SDHUFF=1 (bit 0), SDREFAGG=1 (bit 1); SDHUFFDH/SDHUFFDW
     // select standard tables B.4/B.2 (bits 2-3, 4-5 left 0) -- unused for
@@ -3232,84 +3277,146 @@ SegResult gen_symbol_dict_real_refagg(const std::vector<GeneratedSegment> &prior
     put_be32(d, 1);   // 7.4.2.1.4: SDNUMEXSYMS -- export the one new symbol
     put_be32(d, 1);   // 7.4.2.1.5: SDNUMNEWSYMS
 
-    // Coarse blocks, not a copy of the reference, give the refinement coder
-    // genuine new content to code against a real reference -- the same
-    // choice gen_text_region_real()'s SBREFINE=1 path makes. Computed before
-    // any bits are written below: RSIZE (the encoded byte count) has to be
-    // known before it can be Huffman-coded into the bitstream, and this
-    // computation is otherwise independent of stream position.
-    std::vector<uint8_t> cur((size_t)seed->w * seed->h);
-    for (uint32_t y = 0; y < seed->h; y++)
-        for (uint32_t x = 0; x < seed->w; x++)
-            cur[(size_t)y * seed->w + x] = (uint8_t)(((x >> 1) + (y >> 1)) & 1);
-    std::vector<uint8_t> coded = mq_encode_refinement(
-        (int)seed->w, (int)seed->h, cur.data(), seed->px.data(),
-        sdrtemplate, /*tpgron=*/false, at1.x, at1.y, at2.x, at2.y);
-    uint32_t rsize;
-    std::vector<uint8_t> final_bytes = mq_finalize_refinement(
-        (int)seed->w, (int)seed->h, seed->px.data(), sdrtemplate,
-        at1.x, at1.y, at2.x, at2.y, coded, &rsize);
+    // Pick refagginst symbols from the imported dictionary. For aggregation
+    // (refagginst > 1) they are placed side by side; for refinement
+    // (refagginst == 1) the first symbol is the reference.
+    std::vector<uint32_t> sym_indices;
+    uint32_t agg_w = 0, agg_h = 0;
+    std::vector<uint32_t> agg_rdx, agg_rdy;
+    if (refagginst == 1) {
+        sym_indices.push_back(0);
+        agg_w = imported_syms->front().w;
+        agg_h = imported_syms->front().h;
+        agg_rdx.push_back(0);
+        agg_rdy.push_back(0);
+    } else {
+        // Pick distinct symbols, place them in a row: (0,0), (w0,0), (w0+w1,0), ...
+        std::vector<uint32_t> avail(sdnuminsyms);
+        for (uint32_t i = 0; i < sdnuminsyms; i++)
+            avail[i] = i;
+        // Fisher-Yates partial shuffle for the first refagginst
+        for (uint32_t i = 0; i < refagginst; i++) {
+            uint32_t j = i + (urand() % (sdnuminsyms - i));
+            std::swap(avail[i], avail[j]);
+            sym_indices.push_back(avail[i]);
+        }
+        uint32_t xoff = 0;
+        for (uint32_t idx : sym_indices) {
+            const ExportedSymbol &sym = (*imported_syms)[idx];
+            agg_rdx.push_back(xoff);
+            agg_rdy.push_back(0);
+            xoff += sym.w;
+            if (sym.h > agg_h)
+                agg_h = sym.h;
+        }
+        agg_w = xoff;
+    }
 
-    // HCDH, DW, REFAGGNINST, IDI, RDXI, RDYI, and BMSIZE are all read back
-    // to back off one continuous bitstream (jbig2_sdd_proc.cpp:349-385) --
-    // *no* byte alignment between IDI and RDXI, unlike the flush right
-    // after every other symbol/height-class boundary elsewhere in this
-    // generator -- only the arithmetic bytes that follow BMSIZE get their
-    // own alignment (immediately below).
     BitWriter bw;
-    huff_encode(bw, STD_TABLE(HUFF_B4), (int32_t)seed->h);   // HCDH: HCHEIGHT starts at 0
-    huff_encode(bw, STD_TABLE(HUFF_B2), (int32_t)seed->w);   // DW: SYMWIDTH starts at 0
-    huff_encode(bw, STD_TABLE(HUFF_B1), 1);                  // REFAGGNINST = 1
-    // 6.5.8.2.2: IDI, SBSYMCODELEN raw bits -- 0, the first imported symbol.
-    bw_put_bits(bw, 0, (int)sbsymcodelen);
-    huff_encode(bw, STD_TABLE(HUFF_B15), 0);              // RDXI
-    huff_encode(bw, STD_TABLE(HUFF_B15), 0);              // RDYI
-    huff_encode(bw, STD_TABLE(HUFF_B1), (int32_t)rsize);  // BMSIZE
+    huff_encode(bw, STD_TABLE(HUFF_B4), (int32_t)agg_h);   // HCDH: HCHEIGHT starts at 0
+    huff_encode(bw, STD_TABLE(HUFF_B2), (int32_t)agg_w);   // DW: SYMWIDTH starts at 0
+    huff_encode(bw, STD_TABLE(HUFF_B1), (int32_t)refagginst);
+
+    if (refagginst == 1) {
+        // Simple refinement path: code IDI, RDXI, RDYI, then refinement bitmap.
+        bw_put_bits(bw, 0, (int)sbsymcodelen);
+        huff_encode(bw, STD_TABLE(HUFF_B15), 0);              // RDXI
+        huff_encode(bw, STD_TABLE(HUFF_B15), 0);              // RDYI
+
+        const ExportedSymbol &seed = (*imported_syms)[0];
+        std::vector<uint8_t> cur((size_t)seed.w * seed.h);
+        for (uint32_t y = 0; y < seed.h; y++)
+            for (uint32_t x = 0; x < seed.w; x++)
+                cur[(size_t)y * seed.w + x] = (uint8_t)(((x >> 1) + (y >> 1)) & 1);
+        std::vector<uint8_t> coded = mq_encode_refinement(
+            (int)seed.w, (int)seed.h, cur.data(), seed.px.data(),
+            sdrtemplate, /*tpgron=*/false, at1.x, at1.y, at2.x, at2.y);
+        uint32_t rsize;
+        std::vector<uint8_t> final_bytes = mq_finalize_refinement(
+            (int)seed.w, (int)seed.h, seed.px.data(), sdrtemplate,
+            at1.x, at1.y, at2.x, at2.y, coded, &rsize);
+
+        huff_encode(bw, STD_TABLE(HUFF_B1), (int32_t)rsize);  // BMSIZE
+        bw_finish(bw);
+        append(d, bw.bytes.data(), bw.bytes.size());
+        bw = BitWriter();
+
+        append(d, final_bytes.data(), final_bytes.size());
+        d.push_back(0xFF);
+        d.push_back(0xFF);
+
+        printf("symbol-dictionary handler (%zu bytes, 1 symbol, real refinement content)\n", d.size());
+        SegResult r;
+        r.data = d;
+        r.refs = { import_from };
+        r.num_symbols = 1;
+        ExportedSymbol es;
+        es.w = seed.w;
+        es.h = seed.h;
+        es.px = std::move(cur);
+        r.symbols.push_back(std::move(es));
+        return r;
+    }
+
+    // Aggregation path (refagginst > 1): code each symbol's ID and position,
+    // then a raw collective bitmap (6.5.8.2.1 step c/d).
+    for (size_t i = 0; i < sym_indices.size(); i++) {
+        bw_put_bits(bw, sym_indices[i], (int)sbsymcodelen);   // IDI
+        huff_encode(bw, STD_TABLE(HUFF_B15), (int32_t)agg_rdx[i]);   // RDXI
+        huff_encode(bw, STD_TABLE(HUFF_B15), (int32_t)agg_rdy[i]);   // RDYI
+    }
+
+    // Collective bitmap: row-major, byte-aligned, agg_h rows x ceil(agg_w/8) bytes.
+    // Filled with zeros; the decoder composes the referenced symbols onto it
+    // using REPLACE (6.5.8.2.1 step e), so the final result is the side-by-side
+    // concatenation of the picked symbols.
+    uint32_t row_bytes = (agg_w + 7) / 8;
+    uint32_t bmsize = row_bytes * agg_h;
+    huff_encode(bw, STD_TABLE(HUFF_B1), (int32_t)bmsize);
     bw_finish(bw);
     append(d, bw.bytes.data(), bw.bytes.size());
     bw = BitWriter();
 
-    append(d, final_bytes.data(), final_bytes.size());
-    d.push_back(0xFF);   // trailing bytes a decoder unconditionally skips
-    d.push_back(0xFF);   // over -- see gen_text_region_real()'s comment
+    std::vector<uint8_t> collective((size_t)bmsize, 0);
+    // Pack each picked symbol into the collective bitmap at its (RDXI, RDYI).
+    for (size_t i = 0; i < sym_indices.size(); i++) {
+        const ExportedSymbol &sym = (*imported_syms)[sym_indices[i]];
+        uint32_t ox = agg_rdx[i], oy = agg_rdy[i];
+        for (uint32_t y = 0; y < sym.h; y++) {
+            for (uint32_t x = 0; x < sym.w; x++) {
+                if (sym.px[(size_t)y * sym.w + x]) {
+                    uint32_t gx = ox + x, gy = oy + y;
+                    collective[(size_t)gy * row_bytes + gx / 8] |= (uint8_t)(0x80 >> (gx % 8));
+                }
+            }
+        }
+    }
+    append(d, collective.data(), collective.size());
+    d.push_back(0xFF);
+    d.push_back(0xFF);
 
-    // End the DW loop (6.5.7 step c) -- the only symbol in this height
-    // class, so straight to OOB; SDREFAGG == 1 skips the BMSIZE/collective
-    // -bitmap block entirely (jbig2_sdd_proc.cpp:418), so nothing else
-    // follows before NSYMSDECODED (1) == SDNUMNEWSYMS (1) ends the outer
-    // height-class loop too.
-    huff_encode(bw, STD_TABLE(HUFF_B2), OOB_VAL);
-
-    // 6.5.10: two runs -- not-exported (length SDNUMINSYMS, every imported
-    // symbol) then exported (length 1, the new symbol at index SDNUMINSYMS)
-    // -- covering SDNUMINSYMS + SDNUMNEWSYMS entries, both Table B.1-coded.
-    huff_encode(bw, STD_TABLE(HUFF_B1), (int32_t)sdnuminsyms);
-    huff_encode(bw, STD_TABLE(HUFF_B1), 1);
-    bw_finish(bw);
-    append(d, bw.bytes.data(), bw.bytes.size());
-
-    printf("symbol-dictionary handler (%zu bytes, 1 symbol, real refinement/aggregate content)\n", d.size());
+    printf("symbol-dictionary handler (%zu bytes, 1 symbol, real aggregation content (REFAGGNINST=%u))\n", d.size(), refagginst);
     SegResult r;
     r.data = d;
     r.refs = { import_from };
     r.num_symbols = 1;
-    // mq_encode_refinement() rewrites `cur` in place to hold exactly what a
-    // decoder reconstructs (tpgron is always false here, so unconditionally
-    // exact -- same guarantee gen_text_region_real()'s refined instances
-    // rely on).
+    // The new symbol's pixels are the collective bitmap unpacked.
     ExportedSymbol es;
-    es.w = seed->w;
-    es.h = seed->h;
-    es.px = std::move(cur);
+    es.w = agg_w;
+    es.h = agg_h;
+    es.px.resize((size_t)agg_w * agg_h);
+    for (uint32_t y = 0; y < agg_h; y++)
+        for (uint32_t x = 0; x < agg_w; x++)
+            es.px[(size_t)y * agg_w + x] = (collective[(size_t)y * row_bytes + x / 8] >> (7 - (x % 8))) & 1;
     r.symbols.push_back(std::move(es));
     return r;
 }
 
 // 7.4.2.1 + 6.5.8.2.2: a real, decodable arithmetic (SDHUFF=0) symbol
-// dictionary with refinement/aggregate coding (SDREFAGG=1), REFAGGNINST=1 --
+// dictionary with refinement/aggregate coding (SDREFAGG=1), REFAGGNINST=1..4 --
 // the arithmetic-stream counterpart to gen_symbol_dict_real_refagg() above;
-// see that function's comment for why REFAGGNINST is always 1, why the seed
-// is always imported (never a same-segment new symbol), and why RDXI=RDYI=0
+// see that function's comment for why the seed is always imported (never a
+// same-segment new symbol), and why RDXI=RDYI=0 for the single-symbol case
 // (SYMWIDTH/HCHEIGHT coded to equal the seed's own size exactly). The only
 // structural differences from the Huffman version: SDAT (symbol dictionary
 // AT flags, 7.4.2.1.2) is present here regardless of SDREFAGG since it's
@@ -3321,11 +3428,11 @@ SegResult gen_symbol_dict_real_refagg(const std::vector<GeneratedSegment> &prior
 // starts-at-1 convention.
 SegResult gen_symbol_dict_real_refagg_arith(const std::vector<GeneratedSegment> &prior, uint32_t import_from)
 {
-    const ExportedSymbol *seed = nullptr;
+    const std::vector<ExportedSymbol> *imported_syms = nullptr;
     uint32_t sdnuminsyms = 0;
     for (const auto &seg : prior)
         if (seg.number == import_from && !seg.symbols.empty()) {
-            seed = &seg.symbols[0];
+            imported_syms = &seg.symbols;
             sdnuminsyms = seg.num_symbols;
             break;
         }
@@ -3335,12 +3442,16 @@ SegResult gen_symbol_dict_real_refagg_arith(const std::vector<GeneratedSegment> 
 
     std::vector<uint8_t> d;
 
+    // REFAGGNINST: 1..min(4, sdnuminsyms). Same aggregation logic as the
+    // Huffman path above.
+    uint32_t refagginst = 1 + (urand() % (sdnuminsyms < 4 ? sdnuminsyms : 4));
+
     uint8_t sdtemplate = (uint8_t)(urand() % 4);   // unused by REFAGGNINST==1, but still selects SDAT's count
     // See gen_symbol_dict_real_refagg()'s identical guard: GRTEMPLATE == 1
     // here always hits pdfium's DecodeTemplate1Opt (GRW == seed->w ==
     // GRREFERENCE->width(), GRREFERENCEDX == RDXI == 0), which misreads
     // non-zero padding bits beyond a non-byte-aligned reference width.
-    uint8_t sdrtemplate = (seed->w % 8 == 0) ? (uint8_t)(urand() % 2) : 0;
+    uint8_t sdrtemplate = (imported_syms->front().w % 8 == 0) ? (uint8_t)(urand() % 2) : 0;
 
     // 7.4.2.1.1: SDHUFF=0 (bit 0), SDREFAGG=1 (bit 1); SDTEMPLATE (bits
     // 10-11, structurally present -- see the function comment -- but never
@@ -3367,12 +3478,36 @@ SegResult gen_symbol_dict_real_refagg_arith(const std::vector<GeneratedSegment> 
     put_be32(d, 1);   // 7.4.2.1.4: SDNUMEXSYMS -- export the one new symbol
     put_be32(d, 1);   // 7.4.2.1.5: SDNUMNEWSYMS
 
-    // Coarse blocks, not a copy of the reference -- same choice
-    // gen_symbol_dict_real_refagg() makes, see its comment.
-    std::vector<uint8_t> cur((size_t)seed->w * seed->h);
-    for (uint32_t y = 0; y < seed->h; y++)
-        for (uint32_t x = 0; x < seed->w; x++)
-            cur[(size_t)y * seed->w + x] = (uint8_t)(((x >> 1) + (y >> 1)) & 1);
+    // Pick refagginst symbols from the imported dictionary.
+    std::vector<uint32_t> sym_indices;
+    uint32_t agg_w = 0, agg_h = 0;
+    std::vector<uint32_t> agg_rdx, agg_rdy;
+    if (refagginst == 1) {
+        sym_indices.push_back(0);
+        agg_w = imported_syms->front().w;
+        agg_h = imported_syms->front().h;
+        agg_rdx.push_back(0);
+        agg_rdy.push_back(0);
+    } else {
+        std::vector<uint32_t> avail(sdnuminsyms);
+        for (uint32_t i = 0; i < sdnuminsyms; i++)
+            avail[i] = i;
+        for (uint32_t i = 0; i < refagginst; i++) {
+            uint32_t j = i + (urand() % (sdnuminsyms - i));
+            std::swap(avail[i], avail[j]);
+            sym_indices.push_back(avail[i]);
+        }
+        uint32_t xoff = 0;
+        for (uint32_t idx : sym_indices) {
+            const ExportedSymbol &sym = (*imported_syms)[idx];
+            agg_rdx.push_back(xoff);
+            agg_rdy.push_back(0);
+            xoff += sym.w;
+            if (sym.h > agg_h)
+                agg_h = sym.h;
+        }
+        agg_w = xoff;
+    }
 
     // One continuous arithmetic-coded stream (CJBig2_SDDProc::DecodeArith's
     // single pArithDecoder/gbContexts/grContexts spans, reused verbatim
@@ -3385,44 +3520,104 @@ SegResult gen_symbol_dict_real_refagg_arith(const std::vector<GeneratedSegment> 
     std::vector<uint8_t> iaid_cx(1u << sbsymcodelen, 0);
     std::vector<uint8_t> refine_cx(1u << (sdrtemplate == 0 ? 13 : 10), 0);
 
-    mq_encode_arith_int(mq, iadh, (int32_t)seed->h);   // HCDH: HCHEIGHT starts at 0
-    mq_encode_arith_int(mq, iadw, (int32_t)seed->w);   // DW: SYMWIDTH starts at 0
-    mq_encode_arith_int(mq, iaai, 1);                  // REFAGGNINST = 1
-    mq_encode_arith_iaid(mq, iaid_cx, sbsymcodelen, 0);   // IDI = 0, the first imported symbol
-    mq_encode_arith_int(mq, iardx, 0);                 // RDXI
-    mq_encode_arith_int(mq, iardy, 0);                 // RDYI
-    mq_encode_refinement_into(mq, refine_cx, (int)seed->w, (int)seed->h,
-                               cur.data(), seed->px.data(),
-                               sdrtemplate, /*tpgron=*/false,
-                               at1.x, at1.y, at2.x, at2.y);
+    mq_encode_arith_int(mq, iadh, (int32_t)agg_h);   // HCDH: HCHEIGHT starts at 0
+    mq_encode_arith_int(mq, iadw, (int32_t)agg_w);   // DW: SYMWIDTH starts at 0
+    mq_encode_arith_int(mq, iaai, (int32_t)refagginst);
 
-    // End the DW loop (6.5.7 step c) -- the only symbol in this height
-    // class, so straight to OOB; NSYMSDECODED (1) == SDNUMNEWSYMS (1) then
-    // ends the outer height-class loop too.
-    mq_encode_arith_int(mq, iadw, 0, /*oob=*/true);
+    if (refagginst == 1) {
+        // Simple refinement path.
+        mq_encode_arith_iaid(mq, iaid_cx, sbsymcodelen, 0);   // IDI = 0
+        mq_encode_arith_int(mq, iardx, 0);
+        mq_encode_arith_int(mq, iardy, 0);
 
-    // 6.5.10: two runs -- not-exported (length SDNUMINSYMS, every imported
-    // symbol) then exported (length 1, the new symbol) -- via IAEX instead
-    // of Table B.1.
-    mq_encode_arith_int(mq, iaex, (int32_t)sdnuminsyms);
-    mq_encode_arith_int(mq, iaex, 1);
+        const ExportedSymbol &seed = (*imported_syms)[0];
+        std::vector<uint8_t> cur((size_t)seed.w * seed.h);
+        for (uint32_t y = 0; y < seed.h; y++)
+            for (uint32_t x = 0; x < seed.w; x++)
+                cur[(size_t)y * seed.w + x] = (uint8_t)(((x >> 1) + (y >> 1)) & 1);
+        mq_encode_refinement_into(mq, refine_cx, (int)seed.w, (int)seed.h,
+                                   cur.data(), seed.px.data(),
+                                   sdrtemplate, /*tpgron=*/false,
+                                   at1.x, at1.y, at2.x, at2.y);
+
+        mq_encode_arith_int(mq, iadw, 0, /*oob=*/true);
+        mq_encode_arith_int(mq, iaex, (int32_t)sdnuminsyms);
+        mq_encode_arith_int(mq, iaex, 1);
+        mq_flush(mq);
+        append(d, mq.out.data(), mq.out.size());
+        d.push_back(0xFF);
+        d.push_back(0xFF);
+
+        printf("symbol-dictionary handler (%zu bytes, 1 symbol, real arithmetic refinement content)\n", d.size());
+        SegResult r;
+        r.data = d;
+        r.refs = { import_from };
+        r.num_symbols = 1;
+        ExportedSymbol es;
+        es.w = seed.w;
+        es.h = seed.h;
+        es.px = std::move(cur);
+        r.symbols.push_back(std::move(es));
+        return r;
+    }
+
+    // Aggregation path (refagginst > 1): code each symbol's ID and position,
+    // then a raw collective bitmap.
+    for (size_t i = 0; i < sym_indices.size(); i++) {
+        mq_encode_arith_iaid(mq, iaid_cx, sbsymcodelen, sym_indices[i]);
+        mq_encode_arith_int(mq, iardx, (int32_t)agg_rdx[i]);
+        mq_encode_arith_int(mq, iardy, (int32_t)agg_rdy[i]);
+    }
+
+    // Collective bitmap: row-major, byte-aligned, raw bytes (not arithmetic-coded).
+    // Byte-align the stream before writing raw bytes.
     mq_flush(mq);
     append(d, mq.out.data(), mq.out.size());
+
+    uint32_t row_bytes = (agg_w + 7) / 8;
+    uint32_t bmsize = row_bytes * agg_h;
+    put_be32(d, bmsize);   // BMSIZE as a 4-byte big-endian integer
+
+    std::vector<uint8_t> collective((size_t)bmsize, 0);
+    for (size_t i = 0; i < sym_indices.size(); i++) {
+        const ExportedSymbol &sym = (*imported_syms)[sym_indices[i]];
+        uint32_t ox = agg_rdx[i], oy = agg_rdy[i];
+        for (uint32_t y = 0; y < sym.h; y++) {
+            for (uint32_t x = 0; x < sym.w; x++) {
+                if (sym.px[(size_t)y * sym.w + x]) {
+                    uint32_t gx = ox + x, gy = oy + y;
+                    collective[(size_t)gy * row_bytes + gx / 8] |= (uint8_t)(0x80 >> (gx % 8));
+                }
+            }
+        }
+    }
+    append(d, collective.data(), collective.size());
     d.push_back(0xFF);
     d.push_back(0xFF);
 
-    printf("symbol-dictionary handler (%zu bytes, 1 symbol, real arithmetic refinement/aggregate content)\n", d.size());
+    // End the DW loop and export runs.
+    MQEncoder mq2;
+    ArithIntCtx iadw2, iaex2;
+    mq_encode_arith_int(mq2, iadw2, 0, /*oob=*/true);
+    mq_encode_arith_int(mq2, iaex2, (int32_t)sdnuminsyms);
+    mq_encode_arith_int(mq2, iaex2, 1);
+    mq_flush(mq2);
+    append(d, mq2.out.data(), mq2.out.size());
+    d.push_back(0xFF);
+    d.push_back(0xFF);
+
+    printf("symbol-dictionary handler (%zu bytes, 1 symbol, real arithmetic aggregation content (REFAGGNINST=%u))\n", d.size(), refagginst);
     SegResult r;
     r.data = d;
     r.refs = { import_from };
     r.num_symbols = 1;
-    // tpgron is always false above, so mq_encode_refinement_into() never
-    // touches `cur` -- it already holds exactly what a decoder reconstructs,
-    // by construction.
     ExportedSymbol es;
-    es.w = seed->w;
-    es.h = seed->h;
-    es.px = std::move(cur);
+    es.w = agg_w;
+    es.h = agg_h;
+    es.px.resize((size_t)agg_w * agg_h);
+    for (uint32_t y = 0; y < agg_h; y++)
+        for (uint32_t x = 0; x < agg_w; x++)
+            es.px[(size_t)y * agg_w + x] = (collective[(size_t)y * row_bytes + x / 8] >> (7 - (x % 8))) & 1;
     r.symbols.push_back(std::move(es));
     return r;
 }
@@ -3970,85 +4165,98 @@ SegResult gen_text_region_real(const std::vector<GeneratedSegment> &prior, bool 
     StdHuffTable dt_table = dt_table_sel == 2 ? STD_TABLE(HUFF_B13)
                            : dt_table_sel == 1 ? STD_TABLE(HUFF_B12) : STD_TABLE(HUFF_B11);
 
-    // 6.4.5 step 2: the initial STRIPT value is delta-T coded (6.4.6) and
-    // then *negated*, so the 1 below starts STRIPT at -1; the first
-    // strip's own delta T of 1 (step 4b) brings it back to 0, putting that
-    // strip at T = 0. Neither can simply be coded as 0: B.11-B.13, the
-    // only SBHUFFDT choices (Table 33), all start at 1, so 0 has no
-    // representation -- the spec's own worked example likewise codes an
-    // initial value of 1 to reach a first strip at STRIPT + delta.
-    // FIRSTS/CURS track the same running S position a decoder maintains;
-    // text_placement()/text_pre_advance() hold the rest of 6.4.5-8's
-    // placement math, so that r.bitmap below ends up holding exactly what a
-    // decoder's own ComposeTo() calls would produce.
+    // 6.4.5: multi-strip text region. Initial STRIPT is delta-T coded and
+    // negated; each strip iteration adds a delta T, stopping when
+    // STRIPT >= LOGSBSTRIPS. Within a strip, instances carry a CURT value
+    // (raw bits when SBSTRIPS > 1); the instance's T coordinate is
+    // STRIPT + CURT. FIRSTS/CURS track the running S position a decoder
+    // maintains; text_placement()/text_pre_advance() handle placement.
     bool pre_advance = text_pre_advance(refcorner, transposed);
     int32_t firsts = 0, curs = 0;
     std::vector<uint8_t> canvas((size_t)ri.width * ri.height, sbdefpixel ? 1 : 0);
 
+    // Assign each instance to a (STRIPT, CURT) pair. When SBSTRIPS == 1
+    // all instances land at (0, 0); otherwise they are distributed across
+    // the LOGSBSTRIPS x SBSTRIPS grid so that both the strip loop and the
+    // per-instance CURT decode are exercised.
+    struct InstSlot { uint32_t idx; int32_t stript; uint32_t curt; };
+    std::vector<InstSlot> inst_slots;
+    if (sbnuminstances > 0) {
+        if (sbstrips == 1) {
+            for (uint32_t i = 0; i < sbnuminstances; i++)
+                inst_slots.push_back({i, 0, 0});
+        } else {
+            uint32_t inst = 0;
+            for (int32_t st = 0; st < (int32_t)logsbstrips && inst < sbnuminstances; st++) {
+                for (uint32_t ct = 0; ct < sbstrips && inst < sbnuminstances; ct++) {
+                    // Leave ~25% of slots empty to exercise empty-strip paths
+                    if (urand() % 4 != 0 || inst + (sbstrips - ct) + ((int32_t)logsbstrips - st - 1) * sbstrips <= sbnuminstances)
+                        inst_slots.push_back({inst++, st, ct});
+                }
+            }
+            while (inst < sbnuminstances)
+                inst_slots.push_back({inst++, 0, 0});
+        }
+    }
+
     uint32_t nrefined = 0;
     BitWriter bw;
-    huff_encode(bw, dt_table, 1);
-    if (sbnuminstances > 0) {
-        huff_encode(bw, dt_table, 1);   // this strip's delta T
-        for (uint32_t i = 0; i < sbnuminstances; i++) {
-            if (i == 0) {
-                // With a custom table the only representable value is its
-                // harvested line's own `val` -- anything else would fail
-                // huff_encode()'s representability check.
+    huff_encode(bw, dt_table, 1);   // initial delta T: STRIPT starts at -1
+
+    int32_t stript = -1;
+    size_t slot_pos = 0;
+    for (int32_t target_st = 0; target_st < (int32_t)logsbstrips; target_st++) {
+        huff_encode(bw, dt_table, 1);   // delta T for this strip
+        stript += 1;
+        if (stript >= (int32_t)logsbstrips)
+            break;
+
+        // Collect instances assigned to this STRIPT value
+        size_t strip_start = slot_pos;
+        while (slot_pos < inst_slots.size() && inst_slots[slot_pos].stript == stript)
+            slot_pos++;
+        size_t strip_end = slot_pos;
+
+        if (strip_start == strip_end) {
+            huff_encode(bw, ds_table, OOB_VAL);   // empty strip
+            continue;
+        }
+
+        for (size_t s = strip_start; s < strip_end; s++) {
+            uint32_t instance_idx = inst_slots[s].idx;
+            if (instance_idx == 0) {
                 int32_t dfs = custom_fs_seg ? custom_fs_seg->table_rows[0].val
                                              : 1 + (int32_t)(urand() % 8);
-                huff_encode(bw, fs_table, dfs);   // 6.4.7: first S coordinate
+                huff_encode(bw, fs_table, dfs);
                 firsts += dfs;
                 curs = firsts;
             } else {
                 int32_t ids = (int32_t)(urand() % 8);
-                huff_encode(bw, ds_table, ids);   // 6.4.8: subsequent S coordinate
+                huff_encode(bw, ds_table, ids);
                 curs += ids + sbdsoffset;
             }
-            // 6.4.9: T coordinate. STRIPT is 0 (see the initial delta-T
-            // comment above), so TI is just this instance's own CURT --
-            // spent as raw bits, and only when SBSTRIPS != 1.
+
+            // 6.4.9: CURT (raw bits when SBSTRIPS > 1); T = STRIPT + CURT
             int32_t ti = 0;
             if (sbstrips != 1) {
-                uint32_t curt = urand() % sbstrips;
-                bw_put_bits(bw, curt, curt_bits_for(sbstrips));
-                ti = (int32_t)curt;
+                bw_put_bits(bw, inst_slots[s].curt, curt_bits_for(sbstrips));
+                ti = (int32_t)inst_slots[s].curt;
             }
-            // 6.4.10: symbol ID, as its SBSYMCODES code. Only a symbol the
-            // table gave a code to can be named -- a zero-length entry has
-            // none, so it stays out of the draw.
+            int32_t t_coord = stript + ti;
+
             uint32_t idi = symtab.usable[urand() % symtab.usable.size()];
             bw_put_bits(bw, symtab.code[idi], symtab.len[idi]);
 
             const ExportedSymbol &sym = all_symbols[idi];
-            const uint8_t *place_px = sym.px.data();   // IBI = SBSYMS[IDI] when RI == 0
+            const uint8_t *place_px = sym.px.data();
 
-            // 6.4.11: symbol instance bitmap. RI is only coded at all when
-            // SBREFINE is set; a false RI (or SBREFINE off) leaves IBI as
-            // SBSYMS[IDI] unmodified, needing nothing further here.
-            std::vector<uint8_t> refined_cur;   // keeps `place_px` valid past this scope
+            std::vector<uint8_t> refined_cur;
             if (sbrefine) {
-                // SBRTEMPLATE == 1 sends the refinement through pdfium's
-                // DecodeTemplate1Opt, which reads the reference bitmap a
-                // whole byte at a time and does not mask off the bits past
-                // the symbol's real width in a row's last byte -- exactly
-                // the hazard gen_text_region_real_arith() already guards
-                // against, and which this path was missed by. A symbol
-                // exported from a Huffman symbol dictionary can carry
-                // non-zero bits there, so only refine byte-aligned widths
-                // under that template.
                 bool width_safe_for_refine = sbrtemplate != 1 || (sym.w % 8) == 0;
                 bool ri = width_safe_for_refine && (urand() & 1) != 0;
                 bw_put_bits(bw, ri ? 1 : 0, 1);
                 if (ri) {
                     nrefined++;
-                    // RDWI/RDHI/RDXI/RDYI = 0: WOI/HOI equal the reference
-                    // symbol's own size (Table 12's CheckTRDDimension), and
-                    // GRREFERENCEDX/DY collapse to 0 regardless of the
-                    // divisor -- see the function comment. A coarse-block
-                    // "current" bitmap (not a copy of the reference) gives
-                    // the refinement coder genuine new content to code
-                    // against a real reference.
                     refined_cur.resize((size_t)sym.w * sym.h);
                     for (uint32_t y = 0; y < sym.h; y++)
                         for (uint32_t x = 0; x < sym.w; x++)
@@ -4057,59 +4265,30 @@ SegResult gen_text_region_real(const std::vector<GeneratedSegment> &prior, bool 
                         (int)sym.w, (int)sym.h, refined_cur.data(), sym.px.data(),
                         sbrtemplate, /*tpgron=*/false, at1.x, at1.y, at2.x, at2.y,
                         &refine_cx_state);
-                    // RSIZE must equal the exact number of bytes a real
-                    // decode consumes, which BYTEIN's 0xFF-marker handling
-                    // makes content-dependent -- not simply coded.size()
-                    // (confirmed empirically: the two can differ by several
-                    // bytes either way). mq_finalize_refinement() measures
-                    // it by actually decoding `coded` back.
                     uint32_t rsize;
                     std::vector<uint8_t> final_bytes = mq_finalize_refinement(
                         (int)sym.w, (int)sym.h, sym.px.data(), sbrtemplate,
                         at1.x, at1.y, at2.x, at2.y, coded, &rsize, &refine_measure_cx_state);
 
-                    huff_encode(bw, STD_TABLE(HUFF_B14), 0);   // RDWI
-                    huff_encode(bw, STD_TABLE(HUFF_B14), 0);   // RDHI
-                    huff_encode(bw, STD_TABLE(HUFF_B15), 0);   // RDXI
-                    huff_encode(bw, STD_TABLE(HUFF_B15), 0);   // RDYI
-                    // 6.4.11.5/step 5b: RSIZE, then byte-align -- the
-                    // refinement bitmap's arithmetic coding is byte-based,
-                    // so it (and the 2 bytes below) must start on a byte
-                    // boundary the same way the collective bitmaps in
-                    // gen_symbol_dict_real() do.
+                    huff_encode(bw, STD_TABLE(HUFF_B14), 0);
+                    huff_encode(bw, STD_TABLE(HUFF_B14), 0);
+                    huff_encode(bw, STD_TABLE(HUFF_B15), 0);
+                    huff_encode(bw, STD_TABLE(HUFF_B15), 0);
                     huff_encode(bw, STD_TABLE(HUFF_B1), (int32_t)rsize);
                     bw_finish(bw);
                     append(d, bw.bytes.data(), bw.bytes.size());
                     bw = BitWriter();
 
                     append(d, final_bytes.data(), final_bytes.size());
-                    // 2 trailing bytes a decoder unconditionally skips over
-                    // (matching the +2 already folded into `rsize`) --
-                    // *without* inspecting their value for that skip, but
-                    // their value still matters one step earlier: if
-                    // `final_bytes` itself ends in 0xFF, BYTEIN's
-                    // marker-detection peeks at exactly this next byte to
-                    // decide whether to freeze its byte position, so this
-                    // must be the same 0xFF mq_finalize_refinement() assumed
-                    // was here when it measured `final_bytes`'s length --
-                    // anything else (e.g. 0x00) can make the real decode
-                    // consume a different number of bytes than measured.
                     d.push_back(0xFF);
                     d.push_back(0xFF);
-
-                    // mq_encode_refinement() would rewrite refined_cur where
-                    // TPGRON skipped a pixel, but tpgron is always false
-                    // here, so refined_cur already holds exactly what a
-                    // decoder reconstructs -- verified in the same way as
-                    // the standalone refinement region (round-tripped
-                    // through pdfium's real decoder).
                     place_px = refined_cur.data();
                 }
             }
 
             if (pre_advance)
                 curs += (int32_t)(transposed ? sym.h : sym.w) - 1;
-            TextPlacement p = text_placement(curs, ti, sym.w, sym.h, refcorner, transposed);
+            TextPlacement p = text_placement(curs, t_coord, sym.w, sym.h, refcorner, transposed);
             compose_bitmap(canvas, ri.width, ri.height, place_px, sym.w, sym.h,
                            p.x, p.y, sbcombop);
             curs += p.increment;
@@ -4119,8 +4298,8 @@ SegResult gen_text_region_real(const std::vector<GeneratedSegment> &prior, bool 
     bw_finish(bw);
     append(d, bw.bytes.data(), bw.bytes.size());
 
-    printf("text-region handler (%zu bytes, %u instances, %u refined, %u available symbols, %zu refs, real content%s)\n",
-           d.size(), sbnuminstances, nrefined, sbnumsyms, refs.size(),
+    printf("text-region handler (%zu bytes, %u instances, %u refined, %u available symbols, %zu refs, %u strips, real content%s)\n",
+           d.size(), sbnuminstances, nrefined, sbnumsyms, refs.size(), sbstrips,
            custom_fs_seg ? ", custom FS table" : "");
     SegResult r;
     r.data = d;
@@ -4261,69 +4440,85 @@ SegResult gen_text_region_real_arith(const std::vector<GeneratedSegment> &prior,
     int32_t firsts = 0, curs = 0;
     std::vector<uint8_t> canvas((size_t)ri.width * ri.height, sbdefpixel ? 1 : 0);
 
+    // Multi-strip assignment: same (STRIPT, CURT) grid logic as the
+    // Huffman path above.
+    struct InstSlot { uint32_t idx; int32_t stript; uint32_t curt; };
+    std::vector<InstSlot> inst_slots;
+    if (sbnuminstances > 0) {
+        if (sbstrips == 1) {
+            for (uint32_t i = 0; i < sbnuminstances; i++)
+                inst_slots.push_back({i, 0, 0});
+        } else {
+            uint32_t inst = 0;
+            for (int32_t st = 0; st < (int32_t)logsbstrips && inst < sbnuminstances; st++) {
+                for (uint32_t ct = 0; ct < sbstrips && inst < sbnuminstances; ct++) {
+                    if (urand() % 4 != 0 || inst + (sbstrips - ct) + ((int32_t)logsbstrips - st - 1) * sbstrips <= sbnuminstances)
+                        inst_slots.push_back({inst++, st, ct});
+                }
+            }
+            while (inst < sbnuminstances)
+                inst_slots.push_back({inst++, 0, 0});
+        }
+    }
+
     uint32_t nrefined = 0;
     bool pre_advance = text_pre_advance(refcorner, transposed);
-    // 6.4.5 step 2/4b: INITIAL STRIPT and this (one) strip's own delta T
-    // are both coded as plain 0 -- arithmetic integer coding has no
-    // B.11-B.13-style "can't represent 0" gap the way those standard
-    // Huffman tables do (gen_text_region_real()'s comment), so unlike
-    // there, no "start at -1, offset back to 0" trick is needed.
+    // 6.4.5 step 2/4b: arithmetic integer coding can represent 0 directly,
+    // so initial STRIPT = 0 and each strip's delta T = 1.
     mq_encode_arith_int(mq, iadt, 0);
-    if (sbnuminstances > 0) {
-        mq_encode_arith_int(mq, iadt, 0);   // this strip's delta T
-        for (uint32_t i = 0; i < sbnuminstances; i++) {
-            if (i == 0) {
+
+    int32_t stript = 0;
+    size_t slot_pos = 0;
+    for (int32_t target_st = 0; target_st < (int32_t)logsbstrips; target_st++) {
+        mq_encode_arith_int(mq, iadt, 1);   // delta T for this strip
+        stript += 1;
+        if (stript >= (int32_t)logsbstrips)
+            break;
+
+        size_t strip_start = slot_pos;
+        while (slot_pos < inst_slots.size() && inst_slots[slot_pos].stript == stript)
+            slot_pos++;
+        size_t strip_end = slot_pos;
+
+        if (strip_start == strip_end) {
+            mq_encode_arith_int(mq, iads, 0, /*oob=*/true);
+            continue;
+        }
+
+        for (size_t s = strip_start; s < strip_end; s++) {
+            uint32_t instance_idx = inst_slots[s].idx;
+            if (instance_idx == 0) {
                 int32_t dfs = 1 + (int32_t)(urand() % 8);
-                mq_encode_arith_int(mq, iafs, dfs);   // 6.4.7: first S coordinate
+                mq_encode_arith_int(mq, iafs, dfs);
                 firsts += dfs;
                 curs = firsts;
             } else {
                 int32_t ids = (int32_t)(urand() % 8);
-                mq_encode_arith_int(mq, iads, ids);   // 6.4.8: subsequent S coordinate
+                mq_encode_arith_int(mq, iads, ids);
                 curs += ids + sbdsoffset;
             }
-            // 6.4.9: T coordinate. STRIPT is 0, so TI is this instance's own
-            // CURT -- coded through IAIT, and only when SBSTRIPS != 1
-            // (jbig2_trd_proc.cpp:322 skips the decode entirely otherwise).
+
+            // 6.4.9: CURT via IAIT when SBSTRIPS > 1; T = STRIPT + CURT
             int32_t ti = 0;
             if (sbstrips != 1) {
-                ti = (int32_t)(urand() % sbstrips);
+                ti = (int32_t)inst_slots[s].curt;
                 mq_encode_arith_int(mq, iait, ti);
             }
+            int32_t t_coord = stript + ti;
+
             uint32_t idi = urand() % sbnumsyms;
-            mq_encode_arith_iaid(mq, iaid_cx, sbsymcodelen, idi);   // 6.4.10
+            mq_encode_arith_iaid(mq, iaid_cx, sbsymcodelen, idi);
 
             const ExportedSymbol &sym = all_symbols[idi];
-            const uint8_t *place_px = sym.px.data();   // IBI = SBSYMS[IDI] when RI == 0
+            const uint8_t *place_px = sym.px.data();
 
-            // 6.4.11: symbol instance bitmap. RI is only coded at all when
-            // SBREFINE is set (else it's implicitly 0, no IARI call --
-            // jbig2_trd_proc.cpp:339-343).
             std::vector<uint8_t> refined_cur;
             if (sbrefine) {
-                // GRTEMPLATE == 1 refinement always hits pdfium's
-                // DecodeTemplate1Opt here (GRREFERENCEDX == 0 and GRW ==
-                // reference width always hold, since RDW/RDX are always 0
-                // below). That routine reads the reference bitmap a whole
-                // byte at a time and does NOT mask off the bits beyond the
-                // symbol's real width in a row's last byte -- it trusts
-                // that padding is zero. Symbols exported from a Huffman
-                // symbol dictionary can carry non-zero bits there (an
-                // artifact of how collective bitmaps are split), which we
-                // have no way to predict/replicate at encode time. Avoid
-                // the whole class of divergence by only refining symbols
-                // whose width is byte-aligned, so no row ever has a
-                // partial last byte for Opt to misread.
                 bool width_safe_for_refine = sbrtemplate != 1 || (sym.w % 8) == 0;
                 bool ri_bit = width_safe_for_refine && (urand() & 1) != 0;
                 mq_encode_arith_int(mq, iari, ri_bit ? 1 : 0);
                 if (ri_bit) {
                     nrefined++;
-                    // RDWI/RDHI/RDXI/RDYI = 0 (see the function comment); a
-                    // coarse-block "current" bitmap gives the refinement
-                    // coder genuine new content to code against a real
-                    // reference, same as gen_text_region_real()'s SBHUFF=1
-                    // refined instances.
                     refined_cur.resize((size_t)sym.w * sym.h);
                     for (uint32_t y = 0; y < sym.h; y++)
                         for (uint32_t x = 0; x < sym.w; x++)
@@ -4342,7 +4537,7 @@ SegResult gen_text_region_real_arith(const std::vector<GeneratedSegment> &prior,
 
             if (pre_advance)
                 curs += (int32_t)(transposed ? sym.h : sym.w) - 1;
-            TextPlacement p = text_placement(curs, ti, sym.w, sym.h, refcorner, transposed);
+            TextPlacement p = text_placement(curs, t_coord, sym.w, sym.h, refcorner, transposed);
             compose_bitmap(canvas, ri.width, ri.height, place_px, sym.w, sym.h,
                            p.x, p.y, sbcombop);
             curs += p.increment;
@@ -4354,8 +4549,8 @@ SegResult gen_text_region_real_arith(const std::vector<GeneratedSegment> &prior,
     d.push_back(0xFF);
     d.push_back(0xFF);
 
-    printf("text-region handler (%zu bytes, %u instances, %u refined, %u available symbols, %zu refs, real arithmetic content)\n",
-           d.size(), sbnuminstances, nrefined, sbnumsyms, refs.size());
+    printf("text-region handler (%zu bytes, %u instances, %u refined, %u available symbols, %zu refs, %u strips, real arithmetic content)\n",
+           d.size(), sbnuminstances, nrefined, sbnumsyms, refs.size(), sbstrips);
     SegResult r;
     r.data = d;
     r.refs = refs;
@@ -4405,11 +4600,35 @@ SegResult gen_segment_text_region(const std::vector<GeneratedSegment> &prior)
             break;
         }
 
-    if (have_real_syms)
+    // --mutate-depth=3's geometry axis always takes the fallback path below:
+    // forcing an extreme declared size onto real, arithmetic/Huffman-coded
+    // content risks the declared size disagreeing with what was actually
+    // coded, which would be a second, unintended violation. The fallback's
+    // unmodelled-payload shape has no such coupling, and is already a
+    // well-understood shape this generator produces routinely.
+    if (have_real_syms && !g_geometry_force)
         return sbhuff ? gen_text_region_real(prior, sbrefine)
                       : gen_text_region_real_arith(prior, sbrefine);
 
-    RegionInfo ri = gen_segment_region_info();
+    uint32_t geo_w = 0, geo_h = 0;
+    if (g_geometry_force) {
+        // "Unusual": either a near-zero sliver on one axis, or one axis
+        // blown out toward several times the page's own extent -- both are
+        // syntactically legal per 7.4.1 and both are shapes the ordinary
+        // capped-at-0x10000 draw below essentially never visits. (A literal
+        // 0 isn't reachable through force_w/force_h -- gen_segment_region_
+        // info() treats 0 as "not forced", per its own force_w ? force_w :
+        // ... convention -- so "near-zero" bottoms out at 1, not 0.)
+        if (urand() & 1) {
+            geo_w = 1;
+            geo_h = 1 + urand() % 4;
+        } else {
+            geo_w = g_page_width ? g_page_width * 4 + 1 : 0x10000;
+            geo_h = 1;
+        }
+    }
+    RegionInfo ri = g_geometry_force ? gen_segment_region_info(false, 0x10000, geo_w, geo_h)
+                                      : gen_segment_region_info();
     std::vector<uint8_t> d = ri.bytes;
 
     // 7.4.3.2: a text region draws its symbol instances from the symbol
@@ -4685,6 +4904,15 @@ SegResult gen_segment_halftone_region(const std::vector<GeneratedSegment> &prior
         r.bw = ri.width;
         r.bh = ri.height;
         r.bitmap = std::move(canvas);
+        // Same hazard gen_text_region_real()/gen_text_region_real_arith()
+        // guard against (see GeneratedSegment::ref_padding_dirty): PDFium's
+        // CJBig2_Image::Fill(HDEFPIXEL) writes whole bytes, so with
+        // hdefpixel and a width that isn't byte-aligned, its decoded
+        // halftone region carries set padding bits past the declared width
+        // that this per-pixel canvas never models. A refinement encoded
+        // against this bitmap as GRREFERENCE would then disagree with
+        // CJBig2_GRRDProc's unmasked byte-at-a-time read of those bits.
+        r.ref_padding_dirty = hdefpixel && (ri.width % 8) != 0;
     } else {
         // Coded gray-scale bitplanes, not modeled: no real pattern
         // dictionary available to place real patterns from.
@@ -4882,7 +5110,11 @@ SegResult gen_segment_refinement_region(const std::vector<GeneratedSegment> &pri
     // ParseGenericRefinementRegion() enforces exactly this, rejecting any
     // referred-to segment whose type isn't 4/20/36/40 with a hard parse
     // failure before it even looks at content) -- and, among those, to the
-    // types this generator codes real content for.
+    // types this generator codes real content for, which now includes an
+    // intermediate halftone region: gen_segment_halftone_region() tracks an
+    // exact bitmap the same way the generic/text handlers do, and sets the
+    // same ref_padding_dirty guard for HDEFPIXEL's analogous byte-fill
+    // hazard, so it needs no different treatment here.
     // A region already claimed by an earlier refinement segment is skipped
     // outright: 7.3.1 allows an intermediate region only one non-extension
     // referrer (see g_claimed_intermediate_regions).
@@ -4890,13 +5122,16 @@ SegResult gen_segment_refinement_region(const std::vector<GeneratedSegment> &pri
     for (const auto &seg : prior) {
         if (intermediate_region_claimed(seg.number))
             continue;
+        // A reservation only blocks segments other than the one it was
+        // made for -- see g_forced_single_ref below.
+        if (intermediate_region_reserved(seg.number) &&
+            (uint32_t)g_forced_single_ref != seg.number)
+            continue;
         switch (seg.type) {
         case SEG_INTERMEDIATE_GENERIC: case SEG_INTERMEDIATE_GENERIC_REFINEMENT:
-        case SEG_INTERMEDIATE_TEXT:
+        case SEG_INTERMEDIATE_TEXT: case SEG_INTERMEDIATE_HALFTONE:
             if (!seg.bitmap.empty() && !seg.ref_padding_dirty)
                 refbitmap_pool.push_back(seg.number);
-            [[fallthrough]];
-        case SEG_INTERMEDIATE_HALFTONE:
             region_pool.push_back(seg.number);
             break;
         default:
@@ -4922,7 +5157,18 @@ SegResult gen_segment_refinement_region(const std::vector<GeneratedSegment> &pri
     // refinement referring to an unmodelled region (and of referring to
     // nothing at all); type 40 still reaches that shape whenever the
     // known-bitmap pool happens to be empty.
-    if (!refbitmap_pool.empty() && (must_refer || (urand() & 1))) {
+    if (g_forced_single_ref >= 0) {
+        // --mutate-depth>=2: this is the chain's designated refinement
+        // segment, forced onto the intermediate text region
+        // plan_build_deep_chain() built for it.
+        refs.assign(1, (uint32_t)g_forced_single_ref);
+        for (const auto &seg : prior) {
+            if (seg.number == (uint32_t)g_forced_single_ref) {
+                refseg = &seg;
+                break;
+            }
+        }
+    } else if (!refbitmap_pool.empty() && (must_refer || (urand() & 1))) {
         // 7.4.7.4 permits exactly one referred-to intermediate region here,
         // and a decoder takes the reference from the first entry of the
         // referred-to list, so this is a single-element list by construction.
@@ -5441,6 +5687,49 @@ enum MutationKind {
     MUT_KIND_COUNT
 };
 
+// TODO(mutations): candidates for the next batch, not yet implemented.
+// Each would need its own apply_mutation() case (and, if it targets a field
+// apply_mutation() cannot reach after the fact -- data length, retain-byte
+// counts, table contents -- a hook earlier than the current header-rewrite
+// site, similar to how MUT_PAGE_INFO_LATE/MUT_EOP_EARLY had to move into
+// main() instead).
+//   - retain-byte-count lie (7.2.4 long form): write a retain-bit run whose
+//     byte length doesn't match ceil((R+1)/8) for the declared R, independent
+//     of R itself. This is exactly the shape of the jbig2dec off-by-one bug
+//     found this session (jbig2_segment.c's floor instead of ceil) -- a
+//     dedicated mutation could sweep the boundary deliberately instead of
+//     relying on incidental R>4 draws to stumble across it.
+//   - symbol dictionary export-run overflow (6.5.10): corrupt the IAEX
+//     run-length coding so the cumulative exported-symbol count over- or
+//     under-shoots SDNUMEXSYMS, or leaves a gap/overlap in the run. The
+//     poppler-class numSyms overflow this echoes is closed off in PDFium by
+//     the 64-reference cap, but the export-run bookkeeping itself is a
+//     separate code path neither decoder's bound-checking here has been
+//     exercised against.
+//   - region external combination operator out of range (7.4.1.5): values
+//     5-7 are reserved; write one into a region info's flags byte.
+//   - duplicate page information (7.4.8): a page's "first and only" page
+//     info segment rule, violated by emitting two page-info segments with
+//     the same page association instead of by lateness (which
+//     MUT_PAGE_INFO_LATE already covers).
+//   - declared data length lying: for a segment with a known (non-7.2.7-
+//     unknown) length, write a data_len that doesn't match the segment's
+//     actual byte count -- either short (truncating real content) or long
+//     (claiming bytes that bleed into the next segment's header).
+//   - refinement region size disagreeing with its referent (7.4.7.4 /
+//     6.3.5.3): when GRREFERENCE is a referred-to region rather than the
+//     page, declare a width/height that doesn't match that region's actual
+//     size. Distinct from MUT_MULTIREF_REFINE, which perturbs which segment
+//     is referenced, not whether the declared geometry agrees with it.
+//   - symbol ID Huffman runcode corruption (7.4.3.1.7): malform the fixed
+//     35-entry runcode table's prefix lengths so codes collide or stop being
+//     prefix-free, without touching anything else about the text region.
+//   - extension "necessary" bit on an unrecognized type (7.4.13): set an
+//     extension segment's top type bit (meaning "necessary for correct
+//     interpretation") on a type value no decoder in this toolchain
+//     implements, to see whether either one fails closed the way the spec
+//     implies it should.
+
 static const char *mutation_name(MutationKind k)
 {
     switch (k) {
@@ -5464,6 +5753,55 @@ static const char *mutation_name(MutationKind k)
 // takes it.
 MutationKind g_mutation = MUT_NONE;
 bool g_mutation_fired = false;
+
+// How deeply the mutation should be embedded (--mutate-depth, default 1):
+//   1  today's behaviour, unchanged -- first eligible segment takes it
+//   2  forced onto the refinement edge of a deliberately built
+//      SymbolDictionary -> IntermediateText -> Refinement chain
+//   3  as 2, plus one independent "unusual geometry" perturbation on a
+//      second text region hung off the same chain
+// Every depth->=2 code path is a no-op at the default of 1, so plain
+// --mutate keeps its exact existing distribution.
+int g_mutate_depth = 1;
+
+// --mutate-depth=4 (splice): two independently-generated, fully correct
+// graphs are spliced into one file at the segment level. Their child
+// processes are run with --splice-child, which sets both of these so the
+// parent's parser can walk the result without re-implementing 7.4.6.4's
+// unknown-length terminator scan or D.2's headers-then-data reordering:
+// g_no_unknown_len keeps every segment's data length declared (never
+// 0xFFFFFFFF), and g_splice_child_force_embedded pins the shape to
+// embedded (no file header, plain interleaved header/data pairs).
+bool g_no_unknown_len = false;
+bool g_splice_child_force_embedded = false;
+
+// At depth>=2, the real segment number main() predicted for the deep
+// chain's refinement node -- gensegment()'s mutation hook fires there
+// specifically instead of at the first eligible segment. -1 means "no
+// target set yet"; 0 does NOT mean that, since the optional page-0
+// profiles segment (7.4.12) is genuinely numbered 0 and is generated
+// before any page's deep chain is built, so it would otherwise collide
+// with a 0-valued sentinel.
+int64_t g_deep_mutation_target_number = -1;
+
+// depth>=2's implicit random draw only, when --mutate-depth is given without
+// a pinned --mutate=<kind>. Restricted to kinds that still have something to
+// say once forced onto the deep target: MUT_SELF_REF/MUT_FORWARD_REF die at
+// header parse regardless of where they land, so "deep" buys them nothing,
+// and MUT_CROSS_PAGE_REF needs an already-finished second page, which is in
+// tension with a chain that is always built on page 1. All three stay
+// reachable via an explicit --mutate=<kind> pairing; they are just never the
+// implicit pick.
+static MutationKind random_mutation_kind(int depth)
+{
+    static const MutationKind deep_pool[] = {
+        MUT_DANGLING_REF, MUT_WRONG_TYPE_REF, MUT_DUPLICATE_EDGE,
+        MUT_DUP_SEG_NUMBER, MUT_RESERVED_TYPE, MUT_MULTIREF_REFINE,
+    };
+    if (depth >= 2)
+        return deep_pool[urand() % (sizeof(deep_pool) / sizeof(deep_pool[0]))];
+    return (MutationKind)(1 + (urand() % (MUT_KIND_COUNT - 1)));
+}
 
 // Every segment ever emitted this file, surviving the per-page pool reset that
 // 7.2.6 forces on g_prior_segments -- MUT_CROSS_PAGE_REF needs to reach a page
@@ -5738,7 +6076,7 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
     // at all. Keep lengths known there, and make it a coin flip elsewhere
     // so the (far more common) known-length shape is exercised too, which
     // an unconditional 0xFFFFFFFF never allowed.
-    bool unknown_len = type == SEG_IMMEDIATE_GENERIC &&
+    bool unknown_len = !g_no_unknown_len && type == SEG_IMMEDIATE_GENERIC &&
                        g_organisation != ORG_RANDOM_ACCESS && (urand() & 1);
 
     if (unknown_len) {
@@ -5802,15 +6140,31 @@ std::vector<std::vector<uint8_t> *> gensegment(int forced_type = -1, int32_t for
         data_len = (uint32_t)data.size();
     }
 
-    // One mutation per file, taken by the first segment able to carry it.
-    // The page model cannot predict a mutated decode, so it retires here
-    // rather than reporting a page the oracle would then mis-flag.
-    if (g_mutation != MUT_NONE && !g_mutation_fired && type != SEG_PAGE_INFORMATION) {
+    // One mutation per file. At depth 1, taken by the first segment able to
+    // carry it (g_deep_mutation_target_number stays -1, so is_deep_target
+    // below is always false and the condition reduces to exactly that). At
+    // depth >=2, it is withheld until the specific segment main() predicted
+    // for the deep chain's refinement node comes through, so the violation
+    // lands inside a real dependency chain instead of wherever chance puts
+    // it. The page model cannot predict a mutated decode, so it retires
+    // here rather than reporting a page the oracle would then mis-flag.
+    bool is_deep_target = g_mutate_depth >= 2 && g_deep_mutation_target_number >= 0 &&
+                           (int64_t)segment_number == g_deep_mutation_target_number;
+    if (g_mutation != MUT_NONE && !g_mutation_fired && type != SEG_PAGE_INFORMATION &&
+        (g_mutate_depth == 1 || is_deep_target)) {
         if (apply_mutation(type, segment_number, refs, forced_page, unknown_len)) {
             g_mutation_fired = true;
             g_page_state_known = false;
-            printf("MUTATION %s applied to segment %u (type %u, %zu refs)\n",
-                   mutation_name(g_mutation), segment_number, type, refs.size());
+            printf("MUTATION %s applied to segment %u (type %u, %zu refs, depth %d)\n",
+                   mutation_name(g_mutation), segment_number, type, refs.size(), g_mutate_depth);
+        } else if (is_deep_target) {
+            // The chosen kind's precondition didn't hold on the deep target
+            // after all (e.g. it ended up with no refs to perturb). Fall
+            // back to depth 1's rule for the rest of this file rather than
+            // silently emitting an unmutated file mislabeled as depth>=2.
+            g_mutate_depth = 1;
+            printf("MUTATION: deep target for %s declined; falling back to depth 1\n",
+                   mutation_name(g_mutation));
         }
     }
 
@@ -5895,6 +6249,12 @@ void free_streams(void)
         delete data_streams[i];
     header_streams.clear();
     data_streams.clear();
+    for (size_t i = 0; i < globals_header_streams.size(); i++)
+        delete globals_header_streams[i];
+    for (size_t i = 0; i < globals_data_streams.size(); i++)
+        delete globals_data_streams[i];
+    globals_header_streams.clear();
+    globals_data_streams.clear();
 }
 
 static void push_segment(std::vector<std::vector<uint8_t> *> &seg)
@@ -5903,12 +6263,369 @@ static void push_segment(std::vector<std::vector<uint8_t> *> &seg)
     data_streams.push_back(seg[1]);
 }
 
+// --globals-out: same shape as push_segment(), but for the separate
+// globals stream (see main()).
+static void push_segment_globals(std::vector<std::vector<uint8_t> *> &seg)
+{
+    globals_header_streams.push_back(seg[0]);
+    globals_data_streams.push_back(seg[1]);
+}
+
 // Master init: everything that must happen before generation starts.
 void init_all(void)
 {
     urand_init();
     init_seg_handlers();
     mmr_check_tables();
+}
+
+// ---------------------------------------------------------------------------
+// --mutate-depth=4 (splice): generate two independently correct graphs (each
+// a full, unmutated run of this same generator), then stitch their segments
+// into one file. Neither graph refers to the other, so what results is
+// structurally sound -- every segment header still parses, every reference
+// still points strictly backward (7.2.5) -- while being semantically
+// meaningless: a text region from graph A may end up "referring to" (by
+// renumbered position) a symbol dictionary that was actually graph B's,
+// two unrelated page-information segments may both claim page 1, and so on.
+// Only structural correctness is being tested here, deliberately.
+struct SpliceSegment {
+    uint32_t old_number;
+    uint8_t type;
+    std::vector<uint32_t> refs;
+    uint32_t page;
+    std::vector<uint8_t> data;
+};
+
+// Mirrors jbig2dec_main.cpp's ByteReader/ParseSegmentHeader, extended to
+// capture the full referred-to list and page value (that harness only
+// needed the type and data length). Children are always run with
+// --splice-child, so g_no_unknown_len guarantees data_len is never
+// 0xFFFFFFFF here -- no terminator-scanning fallback is needed.
+static bool splice_parse_segment(const std::vector<uint8_t> &d, size_t &pos,
+                                  uint32_t &number, uint8_t &type,
+                                  std::vector<uint32_t> &refs, uint32_t &page,
+                                  uint32_t &data_len)
+{
+    if (pos + 11 > d.size())
+        return false;
+    number = (d[pos] << 24) | (d[pos + 1] << 16) | (d[pos + 2] << 8) | d[pos + 3];
+    pos += 4;
+    uint8_t flags = d[pos++];
+    type = flags & 0x3f;
+    bool big_page = (flags & 0x40) != 0;
+
+    if (pos >= d.size())
+        return false;
+    uint8_t first = d[pos];
+    uint32_t refcount;
+    if ((first >> 5) == 7) {
+        if (pos + 4 > d.size())
+            return false;
+        uint32_t raw = (d[pos] << 24) | (d[pos + 1] << 16) | (d[pos + 2] << 8) | d[pos + 3];
+        pos += 4;
+        refcount = raw & 0x1fffffff;
+        size_t retain_bytes = (1 + refcount + 7) / 8;
+        if (pos + retain_bytes > d.size())
+            return false;
+        pos += retain_bytes;
+    } else {
+        refcount = first >> 5;
+        pos += 1;
+    }
+
+    uint32_t refsize = number > 65536 ? 4 : number > 256 ? 2 : 1;
+    refs.clear();
+    for (uint32_t i = 0; i < refcount; i++) {
+        if (pos + refsize > d.size())
+            return false;
+        uint32_t v = 0;
+        for (uint32_t b = 0; b < refsize; b++)
+            v = (v << 8) | d[pos + b];
+        pos += refsize;
+        refs.push_back(v);
+    }
+
+    uint32_t page_size = big_page ? 4 : 1;
+    if (pos + page_size > d.size())
+        return false;
+    page = 0;
+    for (uint32_t b = 0; b < page_size; b++)
+        page = (page << 8) | d[pos + b];
+    pos += page_size;
+
+    if (pos + 4 > d.size())
+        return false;
+    data_len = (d[pos] << 24) | (d[pos + 1] << 16) | (d[pos + 2] << 8) | d[pos + 3];
+    pos += 4;
+
+    if (data_len == 0xffffffffu || pos + data_len > d.size())
+        return false;
+    return true;
+}
+
+// Walks one child's plain embedded-shape output (no file header, header
+// immediately followed by its own data, repeated) into an ordered segment
+// list. Stops at end-of-file (type 51, which a --splice-child never emits
+// anyway since it forces embedded organisation) or when the buffer runs out.
+static std::vector<SpliceSegment> splice_parse_graph(const std::vector<uint8_t> &d)
+{
+    std::vector<SpliceSegment> out;
+    size_t pos = 0;
+    while (pos < d.size()) {
+        uint32_t number, page, data_len;
+        uint8_t type;
+        std::vector<uint32_t> refs;
+        if (!splice_parse_segment(d, pos, number, type, refs, page, data_len))
+            break;
+        SpliceSegment seg;
+        seg.old_number = number;
+        seg.type = type;
+        seg.refs = refs;
+        seg.page = page;
+        seg.data.assign(d.begin() + (ptrdiff_t)pos, d.begin() + (ptrdiff_t)(pos + data_len));
+        pos += data_len;
+        out.push_back(std::move(seg));
+        if (type == SEG_END_OF_FILE)
+            break;
+    }
+    return out;
+}
+
+// Runs this same binary as a child to produce one fully correct graph:
+// --ordered for real dependency chains, --splice-child to pin the shape
+// this file's parser expects, no --mutate so the graph is unmutated.
+static std::vector<uint8_t> splice_run_child(const char *argv0)
+{
+    char path_tmpl[] = "/tmp/jbig2gen-splice-XXXXXX";
+    int fd = mkstemp(path_tmpl);
+    if (fd < 0) {
+        perror("mkstemp");
+        exit(1);
+    }
+    close(fd);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        exit(1);
+    }
+    if (pid == 0) {
+        execlp(argv0, argv0, path_tmpl, "--ordered", "--splice-child", (char *)nullptr);
+        perror("execlp");
+        _exit(127);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "splice: child generation failed\n");
+        unlink(path_tmpl);
+        exit(1);
+    }
+
+    std::vector<uint8_t> data;
+    FILE *f = fopen(path_tmpl, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (sz > 0) {
+            data.resize((size_t)sz);
+            if (fread(data.data(), 1, (size_t)sz, f) != (size_t)sz)
+                data.clear();
+        }
+        fclose(f);
+    }
+    unlink(path_tmpl);
+    return data;
+}
+
+enum SpliceStrategy { SPLICE_APPEND, SPLICE_BLOCK_INSERT, SPLICE_RIFFLE };
+
+// One entry in the merged, final order: which source graph a segment came
+// from and its index within that graph's own (still-old-numbered) list.
+struct SpliceRef {
+    int graph;   // 0 = A, 1 = B
+    size_t idx;
+};
+
+static std::vector<SpliceRef> splice_merge_append(const std::vector<SpliceSegment> &a,
+                                                    const std::vector<SpliceSegment> &b)
+{
+    std::vector<SpliceRef> out;
+    // Randomize which graph leads; "splice A into B" and "splice B into A"
+    // are the same shape of test either way.
+    bool a_first = (urand() & 1) != 0;
+    const std::vector<SpliceSegment> &first = a_first ? a : b;
+    const std::vector<SpliceSegment> &second = a_first ? b : a;
+    int first_id = a_first ? 0 : 1;
+    int second_id = a_first ? 1 : 0;
+    for (size_t i = 0; i < first.size(); i++)
+        out.push_back({first_id, i});
+    for (size_t i = 0; i < second.size(); i++)
+        out.push_back({second_id, i});
+    return out;
+}
+
+// Inserts all of graph 1 as one contiguous block at a random point inside
+// graph 2 -- the literal reading of "splice graph one into graph two".
+static std::vector<SpliceRef> splice_merge_block_insert(const std::vector<SpliceSegment> &a,
+                                                          const std::vector<SpliceSegment> &b)
+{
+    std::vector<SpliceRef> out;
+    size_t cut = b.empty() ? 0 : urand() % (b.size() + 1);
+    for (size_t i = 0; i < cut; i++)
+        out.push_back({1, i});
+    for (size_t i = 0; i < a.size(); i++)
+        out.push_back({0, i});
+    for (size_t i = cut; i < b.size(); i++)
+        out.push_back({1, i});
+    return out;
+}
+
+// Riffles the two graphs together, preserving each one's internal relative
+// order (so backward-only references stay backward after renumbering) while
+// randomly deciding, segment by segment, which graph the next one comes
+// from -- the deepest intermixing of the three strategies.
+static std::vector<SpliceRef> splice_merge_riffle(const std::vector<SpliceSegment> &a,
+                                                    const std::vector<SpliceSegment> &b)
+{
+    std::vector<SpliceRef> out;
+    size_t ia = 0, ib = 0;
+    while (ia < a.size() && ib < b.size()) {
+        if (urand() & 1)
+            out.push_back({0, ia++});
+        else
+            out.push_back({1, ib++});
+    }
+    while (ia < a.size())
+        out.push_back({0, ia++});
+    while (ib < b.size())
+        out.push_back({1, ib++});
+    return out;
+}
+
+static const char *splice_strategy_name(SpliceStrategy s)
+{
+    switch (s) {
+    case SPLICE_APPEND: return "append";
+    case SPLICE_BLOCK_INSERT: return "block-insert";
+    case SPLICE_RIFFLE: return "riffle";
+    }
+    return "?";
+}
+
+// Builds and writes the final spliced file. header_mode mirrors main()'s
+// own enum (HEADER_RANDOM/FORCE_ON/FORCE_OFF); when a file header is
+// written, organisation is pinned to sequential, since the merged stream is
+// always assembled in the plain interleaved (header, data, header, data...)
+// shape that sequential organisation is defined to be -- random-access's
+// headers-then-data reordering was never applied to it.
+void splice_main(const char *argv0, const char *out_path, int header_mode)
+{
+    printf("Splice (mutate-depth=4): generating two independent graphs\n");
+    std::vector<uint8_t> file_a = splice_run_child(argv0);
+    std::vector<uint8_t> file_b = splice_run_child(argv0);
+    if (file_a.empty() || file_b.empty()) {
+        fprintf(stderr, "splice: a child produced no output\n");
+        exit(1);
+    }
+
+    std::vector<SpliceSegment> graph_a = splice_parse_graph(file_a);
+    std::vector<SpliceSegment> graph_b = splice_parse_graph(file_b);
+    if (graph_a.empty() || graph_b.empty()) {
+        fprintf(stderr, "splice: failed to parse a child graph\n");
+        exit(1);
+    }
+    printf("splice: graph A = %zu segments, graph B = %zu segments\n",
+           graph_a.size(), graph_b.size());
+
+    SpliceStrategy strategy = (SpliceStrategy)(urand() % 3);
+    printf("splice: strategy = %s\n", splice_strategy_name(strategy));
+    std::vector<SpliceRef> merged;
+    switch (strategy) {
+    case SPLICE_APPEND: merged = splice_merge_append(graph_a, graph_b); break;
+    case SPLICE_BLOCK_INSERT: merged = splice_merge_block_insert(graph_a, graph_b); break;
+    case SPLICE_RIFFLE: merged = splice_merge_riffle(graph_a, graph_b); break;
+    }
+
+    // Assign new, monotonically increasing numbers in merged order, and
+    // record each graph's old->new map so refs can be rewritten. Since both
+    // merge strategies above preserve each graph's internal relative order,
+    // a ref that only ever pointed backward within its own graph still
+    // points backward after renumbering.
+    std::vector<uint32_t> map_a(graph_a.size()), map_b(graph_b.size());
+    uint32_t next_number = 1;
+    for (const SpliceRef &r : merged) {
+        if (r.graph == 0)
+            map_a[r.idx] = next_number++;
+        else
+            map_b[r.idx] = next_number++;
+    }
+
+    // old_number is not necessarily a dense 0..N-1 index (segment 0 is the
+    // optional profiles segment; content can start at 1), so refs are
+    // remapped by value below, via a linear scan for old_number within the
+    // owning graph, rather than by vector position.
+    std::vector<uint8_t> out_stream;
+    for (const SpliceRef &r : merged) {
+        const std::vector<SpliceSegment> &graph = (r.graph == 0) ? graph_a : graph_b;
+        const std::vector<uint32_t> &map = (r.graph == 0) ? map_a : map_b;
+        const SpliceSegment &seg = graph[r.idx];
+        uint32_t new_number = map[r.idx];
+        std::vector<uint32_t> new_refs;
+        new_refs.reserve(seg.refs.size());
+        for (uint32_t old_ref : seg.refs) {
+            // Find old_ref's position within this same graph's list to look
+            // up its new number. Linear scan is fine: graphs here are at
+            // most a few dozen segments.
+            uint32_t mapped = 0;
+            for (size_t i = 0; i < graph.size(); i++) {
+                if (graph[i].old_number == old_ref) {
+                    mapped = map[i];
+                    break;
+                }
+            }
+            new_refs.push_back(mapped);
+        }
+        size_t hdr_len = 0;
+        std::vector<uint8_t> hdr = gensegmentheader(seg.type, new_number, new_refs,
+                                                      (uint32_t)seg.data.size(), &hdr_len,
+                                                      (int32_t)seg.page, false);
+        append(out_stream, hdr.data(), hdr.size());
+        append(out_stream, seg.data.data(), seg.data.size());
+    }
+
+    // File header: same tri-state as main()'s own --header/--no-header/
+    // random, but organisation is fixed to sequential when writing one (see
+    // this function's header comment).
+    bool write_header;
+    switch (header_mode) {
+    case 1: write_header = true; break;   // HEADER_FORCE_ON
+    case 2: write_header = false; break;  // HEADER_FORCE_OFF
+    default: write_header = (urand() & 1) != 0; break; // HEADER_RANDOM
+    }
+    std::vector<uint8_t> final_stream;
+    if (write_header) {
+        static const uint8_t id_string[8] = {0x97, 0x4A, 0x42, 0x32, 0x0D, 0x0A, 0x1A, 0x0A};
+        append(final_stream, id_string, sizeof(id_string));
+        // D.4.2: bit 0 set = sequential (see this function's header
+        // comment for why sequential is the only organisation offered
+        // here); bit 1 clear = page count known but, since splicing does
+        // not track a coherent page count across two unrelated graphs,
+        // claim it unknown instead of asserting a number that has no
+        // real meaning. Bits 2-3 (12-AT / coloured-region) are similarly
+        // left unset: recomputing them would mean re-parsing each
+        // segment's own data-part flags, and no decoder in this
+        // toolchain reads them as anything but informational.
+        uint8_t header_flags = 0x01 | 0x02;
+        final_stream.push_back(header_flags);
+    }
+    append(final_stream, out_stream.data(), out_stream.size());
+
+    serialize_out(final_stream.data(), final_stream.size(), out_path);
+    printf("splice: wrote %zu segments (%zu bytes) to %s\n", merged.size(),
+           final_stream.size(), out_path);
 }
 
 // ---------------------------------------------------------------------------
@@ -5949,16 +6666,20 @@ static size_t plan_add(std::vector<PlanNode> &plan, uint8_t type,
 // successor model cannot say that without carrying the whole set of available
 // providers in its state. Recursion also reaches shapes the uniform draw only
 // stumbles into, like symbol dictionary -> symbol dictionary -> text region.
+// Hoisted to file scope (rather than kept local to plan_expand()) so
+// plan_build_deep_chain()/plan_add_geometry_leg() below can share them
+// without duplicating the type lists.
+static const uint8_t text_types[] = { SEG_INTERMEDIATE_TEXT, SEG_IMMEDIATE_TEXT,
+                                      SEG_IMMEDIATE_LOSSLESS_TEXT };
+static const uint8_t refine_types[] = { SEG_IMMEDIATE_GENERIC_REFINEMENT,
+                                        SEG_IMMEDIATE_LOSSLESS_GENERIC_REFINEMENT };
+
 static void plan_expand(std::vector<PlanNode> &plan)
 {
-    static const uint8_t text_types[] = { SEG_INTERMEDIATE_TEXT, SEG_IMMEDIATE_TEXT,
-                                          SEG_IMMEDIATE_LOSSLESS_TEXT };
     static const uint8_t halftone_types[] = { SEG_INTERMEDIATE_HALFTONE, SEG_IMMEDIATE_HALFTONE,
                                               SEG_IMMEDIATE_LOSSLESS_HALFTONE };
     static const uint8_t generic_types[] = { SEG_INTERMEDIATE_GENERIC, SEG_IMMEDIATE_GENERIC,
                                              SEG_IMMEDIATE_LOSSLESS_GENERIC };
-    static const uint8_t refine_types[] = { SEG_IMMEDIATE_GENERIC_REFINEMENT,
-                                            SEG_IMMEDIATE_LOSSLESS_GENERIC_REFINEMENT };
     static const uint8_t misc_types[] = { SEG_END_OF_STRIPE, SEG_TABLES,
                                           SEG_COLOUR_PALETTE, SEG_EXTENSION };
 
@@ -6016,6 +6737,58 @@ static void plan_expand(std::vector<PlanNode> &plan)
         plan_add(plan, misc_types[urand() % 4]);
         break;
     }
+}
+
+// Result of forcing one guaranteed SymbolDictionary[->SymbolDictionary]->
+// IntermediateText->RefinementRegion chain into the plan, for
+// --mutate-depth>=2. Unlike plan_expand()'s probabilistic RefineUnit (case
+// 8-10 above), which picks an orphan intermediate region most of the time
+// and never wires a symbol-dict chain in at all, this always builds the
+// full chain as real DAG edges, so there is something structurally deep to
+// target rather than hoping one forms.
+struct DeepChain {
+    size_t dict_idx;
+    size_t text_idx;
+    size_t refine_idx;
+    size_t second_text_idx = (size_t)-1;   // level 3 only
+};
+
+// Builds the chain described above and returns the plan indices of its
+// three nodes. Called directly by main(), not through plan_expand()'s
+// probabilistic switch, since depth>=2 needs the chain to exist for sure,
+// not merely with reasonable probability.
+static DeepChain plan_build_deep_chain(std::vector<PlanNode> &plan)
+{
+    DeepChain c;
+    size_t prev = (size_t)-1;
+    size_t chain = 1 + urand() % 3;   // same 1..3 band as TextUnit above
+    for (size_t i = 0; i < chain; i++) {
+        std::vector<size_t> sd_deps;
+        if (prev != (size_t)-1 && (urand() & 1))
+            sd_deps.push_back(prev);
+        prev = plan_add(plan, SEG_SYMBOL_DICTIONARY, sd_deps);
+    }
+    c.dict_idx = prev;
+    // Intermediate specifically: only an intermediate region can be a
+    // refinement's referent (7.3.1).
+    c.text_idx = plan_add(plan, SEG_INTERMEDIATE_TEXT, { c.dict_idx });
+    // One of the *immediate* refinement types (42/43), never
+    // SEG_INTERMEDIATE_GENERIC_REFINEMENT (40): 40's reference is
+    // mandatory, which would need type_mandatory_refs_available() gating
+    // this construction is deliberately built to sidestep.
+    uint8_t rt = refine_types[urand() % 2];
+    c.refine_idx = plan_add(plan, rt, { c.text_idx });
+    return c;
+}
+
+// Level 3's second text region: Dictionary -> TextRegion -> Refinement ->
+// second TextRegion. Depending on the refinement is what guarantees
+// plan_linearize() places it after the rest of the chain; its role is
+// purely to carry an unusual declared geometry (see g_geometry_force in
+// gen_segment_text_region()), not its type or reference shape.
+static size_t plan_add_geometry_leg(std::vector<PlanNode> &plan, size_t after_idx)
+{
+    return plan_add(plan, text_types[urand() % 3], { after_idx });
 }
 
 // Randomized topological order. Kept separate from DAG construction so that
@@ -6087,10 +6860,40 @@ static void print_usage(const char *argv0, FILE *out)
 "                        =<kind> one is chosen at random. A mutated file never\n"
 "                        emits a page model, since its decode is by\n"
 "                        construction not predictable\n"
+"  --mutate-depth=<1-4>  how deeply the mutation is embedded. Implies\n"
+"                        --mutate (and so --ordered) if it wasn't already\n"
+"                        given, except at 4 (see below). Default is 1.\n"
+"                          1  today's behaviour: the first segment able to\n"
+"                             carry it takes it, wherever that lands\n"
+"                          2  forced onto a deliberately built\n"
+"                             SymbolDictionary -> TextRegion ->\n"
+"                             RefinementRegion chain, landing on the\n"
+"                             refinement's reference to the text region\n"
+"                          3  as 2, plus one independent 'unusual geometry'\n"
+"                             perturbation on a second text region hung off\n"
+"                             the same chain. Never chosen by default --\n"
+"                             opt in explicitly\n"
+"                          4  no single rule violation: two independently\n"
+"                             generated, fully correct graphs are spliced\n"
+"                             into one segment-number space (randomly:\n"
+"                             append, insert one as a block inside the\n"
+"                             other, or riffle them together), so every\n"
+"                             segment header still parses and every\n"
+"                             reference still points backward, but the\n"
+"                             file as a whole is semantically nonsense --\n"
+"                             not --mutate compatible, and not ordered by\n"
+"                             the same DAG (it has none of its own)\n"
 "  --dump-page <path>    write the page this run believes it built, in the P4\n"
 "                        PBM layout the harness emits, for byte-for-byte\n"
 "                        comparison. Nothing is written when the page state is\n"
 "                        unknown -- a fallback segment retires the model\n"
+"  --globals-out <path>  split a real symbol dictionary into its own file,\n"
+"                        page-unassociated (0, 7.2.6), the way a PDF's\n"
+"                        JBIG2Globals stream works: two independently-decoded\n"
+"                        buffers sharing one segment-number space instead of\n"
+"                        the usual single self-contained stream. out_path\n"
+"                        gets a page 1 with a real text region referring to\n"
+"                        it, so the pair decodes together\n"
 "  -h, --help            this message\n"
 "\n"
 "Mutation kinds:\n", argv0);
@@ -6122,8 +6925,9 @@ static void print_usage(const char *argv0, FILE *out)
 "Examples:\n"
 "  %s out.jb2 --ordered\n"
 "  %s out.jb2 --ordered --dump-page model.pbm   # then cmp against a decoder\n"
-"  %s out.jb2 --mutate=cross-page-ref --header  # one negative test\n",
-        argv0, argv0, argv0);
+"  %s out.jb2 --mutate=cross-page-ref --header  # one negative test\n"
+"  %s out.jb2 --globals-out globals.jb2         # decode globals.jb2 first\n",
+        argv0, argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv)
@@ -6142,6 +6946,10 @@ int main(int argc, char **argv)
     // generator intended is a bug even when it reports success. Nothing is
     // written when the page state is unknown (see g_page_state_known).
     const char *dump_page_path = nullptr;
+    // --globals-out: path for a separate JBIG2Globals-style stream. See
+    // print_usage() and the block right after the optional profiles segment
+    // in the body below.
+    const char *globals_out_path = nullptr;
     // --ordered plans the content segments as a dependency DAG instead of
     // drawing each type uniformly, so providers land before the segments
     // that need them. See plan_expand()/plan_linearize().
@@ -6157,6 +6965,13 @@ int main(int argc, char **argv)
             header_mode = HEADER_FORCE_OFF;
         } else if (strcmp(argv[i], "--ordered") == 0) {
             ordered_mode = true;
+        } else if (strcmp(argv[i], "--globals-out") == 0 && i + 1 < argc) {
+            globals_out_path = argv[++i];
+        } else if (strcmp(argv[i], "--splice-child") == 0) {
+            // Internal: set only by splice_main()'s own child invocations
+            // (--mutate-depth=4). Not documented as a user-facing flag.
+            g_splice_child_force_embedded = true;
+            g_no_unknown_len = true;
         } else if (strncmp(argv[i], "--mutate", 8) == 0 &&
                    (argv[i][8] == '\0' || argv[i][8] == '=')) {
             // --mutate picks one at random; --mutate=<name> pins it, which is
@@ -6177,6 +6992,17 @@ int main(int argc, char **argv)
             } else {
                 g_mutation = (MutationKind)(1 + (urand() % (MUT_KIND_COUNT - 1)));
             }
+        } else if (strncmp(argv[i], "--mutate-depth", 14) == 0 && argv[i][14] == '=') {
+            const char *val = argv[i] + 15;
+            char *end = nullptr;
+            long depth = strtol(val, &end, 10);
+            if (end == val || *end != '\0' || depth < 1 || depth > 4) {
+                fprintf(stderr, "%s: --mutate-depth must be 1, 2, 3 or 4 (got '%s')\n",
+                        argv[0], val);
+                print_usage(argv[0], stderr);
+                return 1;
+            }
+            g_mutate_depth = (int)depth;
         } else if (strcmp(argv[i], "--dump-page") == 0 && i + 1 < argc) {
             dump_page_path = argv[++i];
         } else if (argv[i][0] == '-' || out_path_set) {
@@ -6189,10 +7015,42 @@ int main(int argc, char **argv)
         }
     }
 
+    // Resolved after the whole command line is parsed, not inline, so flag
+    // order doesn't matter: --mutate-depth=2 --mutate=... and
+    // --mutate=... --mutate-depth=2 must behave identically. Depth 4
+    // (splice) doesn't use apply_mutation() at all -- its "violation" is
+    // structural (two unrelated graphs sharing one number space), decided
+    // entirely inside splice_main() -- so it's excluded from this block.
+    if (g_mutate_depth > 1 && g_mutate_depth < 4 && g_mutation == MUT_NONE) {
+        ordered_mode = true;
+        g_mutation = random_mutation_kind(g_mutate_depth);
+    }
+    if (g_mutate_depth > 1 && g_mutate_depth < 4 &&
+        (g_mutation == MUT_PAGE_INFO_LATE || g_mutation == MUT_EOP_EARLY)) {
+        // Positional mutations move a segment relative to page-info/end-of-
+        // page; they don't name a specific segment to perturb, so "target a
+        // deep chain node" has no meaning for them.
+        fprintf(stderr, "%s: --mutate=%s is positional and only supports "
+                         "--mutate-depth=1\n", argv[0], mutation_name(g_mutation));
+        return 1;
+    }
+
     init_all();
+
+    if (g_mutate_depth == 4) {
+        splice_main(argv[0], out_path, (int)header_mode);
+        return 0;
+    }
+
     Organization org;
     bool write_header;
-    switch (header_mode) {
+    if (g_splice_child_force_embedded) {
+        // Splice children (see splice_main()) always want the plain,
+        // trivially-reparseable embedded shape: no file header, and no
+        // random-access headers-then-data reordering to undo.
+        org = ORG_EMBEDDED;
+        write_header = false;
+    } else switch (header_mode) {
     case HEADER_FORCE_ON:
         // Both header-bearing organizations stay in play, chosen the same
         // way choose_organisation() would between them.
@@ -6237,6 +7095,25 @@ int main(int argc, char **argv)
         push_segment(profiles);
     }
 
+    // --globals-out: build a real, page-0 ("not associated with any page",
+    // 7.2.6) symbol dictionary and route it to the separate globals stream
+    // instead of out_path's own header_streams/data_streams -- the same
+    // shape a PDF's JBIG2Globals stream carries. gensegment() registers it
+    // in g_prior_segments/g_all_segments regardless of which stream its
+    // bytes end up in, and page-0 entries are never evicted by the
+    // per-page erase-if just below, so it stays visible to every later
+    // page exactly as if it had been written inline. That is also why no
+    // separate reference-forcing is needed for the consumer below:
+    // gen_segment_text_region()'s own have_real_syms check
+    // (SEG_SYMBOL_DICTIONARY with num_symbols > 0 in prior) already finds
+    // it and takes the real-content path instead of the fallback.
+    bool want_globals_consumer = false;
+    if (globals_out_path) {
+        std::vector<std::vector<uint8_t> *> gdict = gensegment(SEG_SYMBOL_DICTIONARY, 0);
+        push_segment_globals(gdict);
+        want_globals_consumer = true;
+    }
+
     // Most files hold one page; some hold several. Each is built the same
     // way and simply carries its own page association.
     uint32_t number_of_pages = (urand() % 4 == 0) ? 2 + (urand() % 3) : 1;
@@ -6271,6 +7148,18 @@ int main(int argc, char **argv)
     // back to this position.
     size_t page_info_pos = header_streams.size();
     uint32_t page_info_number = g_next_segment_number++;
+
+    // --globals-out: guarantee at least one real consumer of the globals
+    // dictionary, on page 1, rather than leaving it to however the normal
+    // content draw below happens to land. gen_segment_text_region() picks
+    // it up automatically (see the comment where want_globals_consumer is
+    // set) and produces real, decodable content referring to it.
+    if (page_number == 1 && want_globals_consumer) {
+        std::vector<std::vector<uint8_t> *> gtext =
+            gensegment(SEG_IMMEDIATE_LOSSLESS_TEXT, (int32_t)page_number);
+        push_segment(gtext);
+        want_globals_consumer = false;
+    }
 
     // Content-segment count. Reference-shape coverage is bounded by how
     // many earlier segments of a given type exist to refer to, and with
@@ -6352,9 +7241,44 @@ int main(int argc, char **argv)
         // unordered path draws, so the two modes stay comparable on file size
         // rather than differing because one simply writes more segments.
         std::vector<PlanNode> plan;
+        // --mutate-depth>=2: force a guaranteed SymbolDictionary->
+        // IntermediateText->RefinementRegion chain into the plan before the
+        // ordinary probabilistic expansion runs, so depth>=2 always has a
+        // real deep structure to target rather than hoping plan_expand()
+        // stumbles into one. Page 1 only -- a fresh chain every page would
+        // just be more of the same test, and g_reserved_intermediate_numbers
+        // below is only meaningful for the one page it's built on.
+        DeepChain deep;
+        bool have_deep = g_mutate_depth >= 2 && page_number == 1;
+        if (have_deep) {
+            deep = plan_build_deep_chain(plan);
+            if (g_mutate_depth >= 3)
+                deep.second_text_idx = plan_add_geometry_leg(plan, deep.refine_idx);
+        }
         while (plan.size() < ncontent)
             plan_expand(plan);
-        for (size_t idx : plan_linearize(plan)) {
+
+        std::vector<size_t> order = plan_linearize(plan);
+        // Real segment numbers are predictable before any segment is
+        // actually emitted: the loop below calls gensegment() once per
+        // entry of `order`, always consuming the next value of
+        // g_next_segment_number in order, so the plan node at linearized
+        // position k gets real number content_base + k.
+        std::vector<size_t> position_of(plan.size());
+        for (size_t k = 0; k < order.size(); k++)
+            position_of[order[k]] = k;
+        uint32_t content_base = g_next_segment_number;
+        if (have_deep) {
+            uint32_t deep_text_number = content_base + (uint32_t)position_of[deep.text_idx];
+            g_deep_mutation_target_number =
+                content_base + (uint32_t)position_of[deep.refine_idx];
+            // Keeps any *other*, independently-generated RefineUnit in this
+            // same plan from claiming the chain's own intermediate region
+            // before the designated refinement segment reaches it.
+            g_reserved_intermediate_numbers.push_back(deep_text_number);
+        }
+
+        for (size_t idx : order) {
             uint8_t t = plan[idx].type;
             // The plan is a preference, not a promise. A dependency edge says
             // a provider was *planned* earlier, not that its handler produced
@@ -6364,9 +7288,18 @@ int main(int argc, char **argv)
             // refers to nothing and always fits.
             if (!type_mandatory_refs_available(t))
                 t = SEG_IMMEDIATE_GENERIC;
+            if (have_deep && idx == deep.refine_idx)
+                g_forced_single_ref =
+                    (int64_t)(content_base + (uint32_t)position_of[deep.text_idx]);
+            if (have_deep && idx == deep.second_text_idx)
+                g_geometry_force = true;
             std::vector<std::vector<uint8_t> *> seg = gensegment(t, (int32_t)page_number);
+            g_forced_single_ref = -1;
+            g_geometry_force = false;
             push_segment(seg);
         }
+        if (have_deep)
+            g_reserved_intermediate_numbers.clear();
     } else {
         for (size_t i = 0; i < ncontent; i++) {
             std::vector<std::vector<uint8_t> *> seg = gensegment(-1, (int32_t)page_number);
@@ -6459,6 +7392,20 @@ int main(int argc, char **argv)
     assemble_org_order(org);
 
     serialize_out(stream.data(), stream.size(), out_path);
+
+    // --globals-out: a JBIG2Globals stream is always the embedded shape
+    // (D.3) -- no file header, segment header immediately followed by its
+    // own data, regardless of what organization out_path ended up with.
+    if (globals_out_path) {
+        std::vector<uint8_t> globals_stream;
+        for (size_t i = 0; i < globals_header_streams.size(); i++) {
+            append(globals_stream, globals_header_streams[i]->data(),
+                   globals_header_streams[i]->size());
+            append(globals_stream, globals_data_streams[i]->data(),
+                   globals_data_streams[i]->size());
+        }
+        serialize_out(globals_stream.data(), globals_stream.size(), globals_out_path);
+    }
 
     // --dump-page: the page this run believes it built, in jbig2dec's own
     // P4 PBM layout. Bits come out inverted because pdfium's decoder flips
